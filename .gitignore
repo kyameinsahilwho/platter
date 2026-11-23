@@ -1,0 +1,12 @@
+# Rust / Tauri build output (rebuilt by `cargo build`)
+/target/
+/gen/schemas/
+
+# Built installers (rebuild with `npx @tauri-apps/cli@2 build --bundles nsis`)
+/dist/
+
+# Benchmark logs
+/bench/*.json
+
+# Baseline benchmark binary (rebuildable, too large for git)
+/bench/*.exe

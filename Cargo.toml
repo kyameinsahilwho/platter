@@ -1,0 +1,54 @@
+[package]
+name = "platter"
+version = "1.0.0"
+edition = "2021"
+description = "Platter — see, clean, optimize and manage the disks on a Windows PC"
+build = "build.rs"
+
+[[bin]]
+name = "platter"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+rayon = "1"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+  "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_System_Com",
+  "Win32_System_EventLog",
+  "Win32_System_Registry",
+  "Win32_System_SystemInformation",
+  "Wdk_Foundation",
+  "Wdk_Storage_FileSystem",
+]
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+# Measured on this PC (2026-11-23): fat LTO + 1 codegen unit makes platter.exe 7.11 MB instead of
+# 8.95 MB (thin, 4 units) with the same startup (first paint 514 vs 515 ms, median of 7 interleaved
+# launches); a cold release build takes ~8 min instead of ~6.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = true
