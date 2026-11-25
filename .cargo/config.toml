@@ -1,0 +1,5 @@
+[build]
+# MinGW windres passes the build-script output folder to its preprocessor unquoted, so a target folder
+# whose path has a space ("D:\SKS coding\...") fails with "cc1.exe: fatal error: coding\...: No such file".
+# Build outside the project, in a folder without spaces. Remove this if the project moves to such a path.
+target-dir = "D:/platter-target"

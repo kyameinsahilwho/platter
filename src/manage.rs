@@ -489,7 +489,7 @@ fn get_long_path(p: &str) -> Option<String> {
 /// Turn a recycle request into the exact path Windows will act on, so the safety checks judge the same
 /// item that gets recycled: `.`/`..` collapsed, 8.3 short names expanded. Names ending in a dot or a
 /// space are refused, because Windows would silently act on the name without them.
-fn normalize_target(raw: &str) -> Result<PathBuf, String> {
+pub(crate) fn normalize_target(raw: &str) -> Result<PathBuf, String> {
     // clean_path trims, which would turn an item named "x " into a different item "x".
     let raw = raw.trim_start();
     if raw.ends_with(|c: char| c.is_whitespace()) {
@@ -530,7 +530,7 @@ fn is_inside(child: &str, parent: &str) -> bool {
 
 /// Paths Platter refuses to recycle: drive roots, Windows itself, program folders, the Users folder,
 /// the user profile and its main folders.
-fn refuse_reason(path: &Path) -> Option<String> {
+pub(crate) fn refuse_reason(path: &Path) -> Option<String> {
     let shown = path.display().to_string();
     let r = resolved(path);
     let is_root = path.parent().is_none()
@@ -569,7 +569,7 @@ fn refuse_reason(path: &Path) -> Option<String> {
 }
 
 /// Check and normalize every requested path; returns the ones that still exist, as Windows will see them.
-fn recycle_targets(paths: &[String]) -> Result<Vec<String>, String> {
+pub(crate) fn recycle_targets(paths: &[String]) -> Result<Vec<String>, String> {
     let mut list: Vec<String> = Vec::new();
     for raw in paths {
         let path = normalize_target(raw)?;
@@ -588,7 +588,7 @@ fn recycle_targets(paths: &[String]) -> Result<Vec<String>, String> {
     Ok(list)
 }
 
-fn recycle_sync(paths: &[String]) -> Result<(), String> {
+pub(crate) fn recycle_sync(paths: &[String]) -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::{
         SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, FO_DELETE,
         SHFILEOPSTRUCTW,

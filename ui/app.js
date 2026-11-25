@@ -86,7 +86,10 @@ function relTime(iso) {
   if (a < 86400 * 70) return out(Math.round(a / 604800), "week");
   return out(Math.round(a / 2629800), "month");
 }
-const shortDate = (iso) => new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: new Date(iso).getFullYear() === new Date().getFullYear() ? undefined : "numeric" });
+// A date-only "YYYY-MM-DD" (an app's install date) is a calendar day: read it as local midnight,
+// not UTC midnight, or it shows a day early west of UTC.
+const toDate = (iso) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso); return m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(iso); };
+const shortDate = (iso) => { const d = toDate(iso); return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric" }); };
 const daysSince = (iso) => (Date.now() - new Date(iso).getTime()) / 86400000;
 
 const driveName = (v) => `${v.label || (v.kind === "removable" ? "USB drive" : v.kind === "network" ? "Network drive" : "Local Disk")} (${v.letter}:)`;
@@ -121,6 +124,12 @@ const S = {
   opt: { running: null, results: {} },
   checks: {},      // letter -> { status: "running" } | result | { error }
   drafts: { label: {}, letter: {} }, // letter -> what the user typed/picked on Manage, kept across re-renders
+  cleanSub: "caches", // last Clean up section shown (caches | apps | dupes)
+  // Uninstall apps. left = the leftovers screen (one app's, or orphans) when it's open.
+  apps: { status: "idle", list: [], error: null, q: "", sort: "name", busy: null, notice: null, left: null },
+  // Duplicates. status: setup | running | done | error.
+  dupes: { status: "setup", roots: null, picked: null, custom: [], opts: null, scanId: 0, progress: null, result: null,
+    index: new Map(), sel: new Set(), section: "files", shown: 120, error: null, finishedAt: 0, deleting: false, lastDelete: null, early: null },
 };
 
 function vol(letter) { return S.volumes.find((v) => v.letter === letter); }
@@ -259,10 +268,28 @@ function renderRail() {
     ${fixed.map(driveBtn).join("")}
     ${other.length ? `<div class="rail-group">Network and optical</div>${other.map(driveBtn).join("")}` : ""}
   `));
-  patch($("#elevation"), S.sys.elevated
-    ? `<div class="elev is-admin">${icon("shield-check")}<span class="elev-title">Administrator</span><span class="elev-text">Every tool is available.</span></div>`
+  // null: elevated as another Windows account, where the setting can't be reached (change it in standard mode).
+  const askAtStart = S.sys.askAdminAtStart === null ? "" : `<label class="elev-auto" title="Windows asks for administrator rights each time Platter opens">
+        <input type="checkbox" id="ask-admin" ${S.sys.askAdminAtStart !== false ? "checked" : ""} /><span>Ask at startup</span></label>`;
+  // Also called outside render() (polling ticks): keep focus on the checkbox if this redraws it.
+  restoringFocus(() => patch($("#elevation"), S.sys.elevated
+    ? `<div class="elev is-admin">${icon("shield-check")}<span class="elev-title">Administrator</span><span class="elev-text">Every tool is available.</span>${askAtStart}</div>`
     : `<div class="elev">${icon("shield")}<span class="elev-title">Standard mode</span><span class="elev-text">Trim, defragment and some clean-up need administrator rights.</span>
-        <button class="link-btn" data-action="elevate">Restart as administrator</button></div>`);
+        <button class="link-btn" data-action="elevate">Restart as administrator</button>${askAtStart}</div>`));
+}
+
+async function setAskAdmin(enabled) {
+  S.sys.askAdminAtStart = enabled;
+  try {
+    await invoke("set_ask_admin", { enabled });
+    toast(enabled ? "Platter will ask for administrator rights each time it opens." : "Platter will open in standard mode.");
+  } catch (e) {
+    // Put the box back as it was (the rail's HTML may be unchanged, so patch() wouldn't redraw it).
+    S.sys.askAdminAtStart = !enabled;
+    const cb = $("#ask-admin");
+    if (cb) cb.checked = !enabled;
+    toast(errText(e), { tone: "bad" });
+  }
 }
 
 /* ------------------------------------------------------------------ routing & render */
@@ -271,9 +298,10 @@ function go(route) {
   const prev = S.route;
   S.route = { ...route };
   if (route.view === "drive" && !route.tab) S.route.tab = prev.view === "drive" ? prev.tab : "overview";
+  if (route.view === "cleanup") S.route.sub = CLEAN_SUBS.some(([k]) => k === route.sub) ? route.sub : S.cleanSub;
   render({ resetScroll: true });
   saveRoute();
-  if (S.route.view === "cleanup") measureIfStale();
+  if (S.route.view === "cleanup") enterCleanSub();
 }
 
 // The last place the user was (view, drive, tab) is restored at the next launch.
@@ -281,12 +309,14 @@ const ROUTE_KEY = "platter.route";
 const TABS = ["overview", "space", "optimize", "manage"];
 function saveRoute() {
   const r = S.route;
-  try { localStorage.setItem(ROUTE_KEY, JSON.stringify(r.view === "drive" ? { view: "drive", letter: r.letter, tab: r.tab } : { view: r.view })); } catch {}
+  if (r.view === "cleanup") S.cleanSub = cleanSub();
+  try { localStorage.setItem(ROUTE_KEY, JSON.stringify(r.view === "drive" ? { view: "drive", letter: r.letter, tab: r.tab } : r.view === "cleanup" ? { view: "cleanup", sub: cleanSub() } : { view: r.view })); } catch {}
 }
 function savedRoute() {
   try {
     const r = JSON.parse(localStorage.getItem(ROUTE_KEY) || "null");
-    if (r?.view === "pc" || r?.view === "cleanup") return { view: r.view };
+    if (r?.view === "pc") return { view: r.view };
+    if (r?.view === "cleanup") return { view: "cleanup", sub: CLEAN_SUBS.some(([k]) => k === r.sub) ? r.sub : "caches" };
     if (r?.view === "drive" && vol(r.letter)) return { view: "drive", letter: r.letter, tab: TABS.includes(r.tab) ? r.tab : "overview" };
   } catch {}
   return null;
@@ -305,7 +335,7 @@ function focusKey(el) {
   if (el.id) return `#${CSS.escape(el.id)}`;
   const a = el.dataset?.action;
   if (!a) return null;
-  for (const k of ["id", "tab", "letter", "view", "path", "mode", "v", "i"]) {
+  for (const k of ["id", "tab", "sub", "letter", "view", "path", "mode", "v", "i", "gid"]) {
     const val = el.dataset[k];
     if (val != null) return `[data-action="${CSS.escape(a)}"][data-${k}="${CSS.escape(val)}"]`;
   }
@@ -333,7 +363,7 @@ function render({ resetScroll = false } = {}) {
     if (r.view === "pc") main.innerHTML = viewPC();
     else if (r.view === "cleanup") {
       // Already showing Clean up: update only the parts that changed (progress, sizes, one checkbox).
-      if (!resetScroll && $("#clean-page")) updateCleanup();
+      if (!resetScroll && $("#clean-page")?.dataset.sub === cleanSub()) updateCleanup();
       else { main.innerHTML = viewCleanup(); updateCleanup(); }
     }
     else { main.innerHTML = viewDrive(vol(r.letter)); afterPanel(); }
@@ -1283,15 +1313,19 @@ const CLEAN_GROUPS = ["System", "Browsers", "Apps", "Developer caches", "Review"
 
 // The Clean up page is a fixed frame; updateCleanup() fills and refreshes its parts in place.
 function viewCleanup() {
-  return `<div class="page" id="clean-page">
+  const sub = cleanSub();
+  return `<div class="page" id="clean-page" data-sub="${sub}">
     <header class="page-head">
-      <div><h1 class="page-title">Clean up</h1><p class="page-sub">Files that Windows and your apps recreate on their own. Your documents, photos, passwords and browsing history are never touched.</p></div>
+      <div><h1 class="page-title">Clean up</h1><p class="page-sub">${esc(CLEAN_SUB_TEXT[sub])}</p></div>
       <div class="head-actions" id="clean-head"></div>
     </header>
-    <section class="clean-summary" id="clean-summary"></section>
+    <nav class="tabs" role="tablist" aria-label="Clean up sections">
+      ${CLEAN_SUBS.map(([k, label]) => `<button class="tab" role="tab" data-action="clean-sub" data-sub="${k}" aria-selected="${sub === k}">${label}</button>`).join("")}
+    </nav>
+    ${sub === "caches" ? `<section class="clean-summary" id="clean-summary"></section>
     <div class="contents" id="clean-notices"></div>
     <div class="groups" id="clean-groups"></div>
-    <div class="contents" id="clean-foot"></div>
+    <div class="contents" id="clean-foot"></div>` : `<div id="${sub}-body"></div>`}
   </div>`;
 }
 
@@ -1301,6 +1335,13 @@ function cleanAgeText() {
 }
 
 function updateCleanup() {
+  const sub = cleanSub();
+  if (sub === "apps") return updateApps();
+  if (sub === "dupes") return updateDupes();
+  updateCaches();
+}
+
+function updateCaches() {
   const C = S.cleanup;
   const items = C.items.filter((it) => it.available);
   const missing = C.items.filter((it) => !it.available && it.kind !== "review");
@@ -1503,6 +1544,774 @@ async function runCleanup() {
   analyzeCleanup({ background: false });
 }
 
+/* ------------------------------------------------------------------ Clean up sections */
+
+const CLEAN_SUBS = [["caches", "Caches & leftovers"], ["apps", "Uninstall apps"], ["dupes", "Duplicates"]];
+const CLEAN_SUB_TEXT = {
+  caches: "Files that Windows and your apps recreate on their own. Your documents, photos, passwords and browsing history are never touched.",
+  apps: "Remove apps with their own uninstaller, then clear out the folders, settings, services and tasks they leave behind.",
+  dupes: "Find copies of the same file by their contents, not their names, plus near-identical photos and videos and copied folders.",
+};
+function cleanSub() {
+  const s = S.route.sub;
+  return CLEAN_SUBS.some(([k]) => k === s) ? s : "caches";
+}
+// Work a section needs when it's opened.
+function enterCleanSub() {
+  const sub = cleanSub();
+  if (sub === "caches") measureIfStale();
+  else if (sub === "apps") loadApps();
+  else if (sub === "dupes") loadDupeRoots();
+}
+function setCleanSub(sub) {
+  if (S.route.view !== "cleanup" || sub === cleanSub()) return;
+  S.route.sub = sub;
+  render({ resetScroll: true });
+  saveRoute();
+  enterCleanSub();
+}
+const isCleanSub = (sub) => S.route.view === "cleanup" && cleanSub() === sub;
+
+// A section body is a fixed frame per mode; parts inside it are patched in place.
+function frame(host, mode, html) {
+  if (host.dataset.mode === mode) return false;
+  host.dataset.mode = mode;
+  host.innerHTML = html;
+  return true;
+}
+
+/* ---------- Uninstall apps ---------- */
+
+async function loadApps(force = false) {
+  const A = S.apps;
+  if (A.status === "loading" || (A.status === "ready" && !force)) return;
+  A.status = "loading"; A.error = null;
+  rerenderApps();
+  try { A.list = await invoke("apps_list"); A.status = "ready"; }
+  catch (e) { A.status = "error"; A.error = errText(e); }
+  rerenderApps();
+}
+function rerenderApps() { if (isCleanSub("apps")) render(); }
+
+function visibleApps() {
+  const A = S.apps, q = A.q.trim().toLowerCase();
+  const l = q ? A.list.filter((a) => `${a.name} ${a.publisher}`.toLowerCase().includes(q)) : A.list.slice();
+  const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+  if (A.sort === "size") l.sort((a, b) => b.size - a.size || byName(a, b));
+  else if (A.sort === "date") l.sort((a, b) => (b.installDate || "").localeCompare(a.installDate || "") || byName(a, b));
+  else l.sort(byName);
+  return l;
+}
+
+function updateApps() {
+  const A = S.apps;
+  const host = $("#apps-body");
+  if (!host) return;
+  if (A.left) return updateLeftovers(host);
+  patch($("#clean-head"), `<button class="btn" data-action="apps-reload" ${A.status === "loading" || A.busy ? "disabled" : ""}>${A.status === "loading" ? icon("loader-circle", "spin") + "Loading…" : icon("refresh-cw") + "Refresh list"}</button>`);
+  if (frame(host, "list", `
+      <div class="note orphan-note">${icon("scan-search")}<span class="note-title">Leftovers from apps you already removed</span>
+        <span class="note-text">Uninstall entries for apps that are gone, services and scheduled tasks whose program is missing, startup entries that point nowhere, and program folders with nothing left to run.</span>
+        <button class="btn" data-action="orphans">Look for leftovers</button></div>
+      <div id="apps-notice"></div>
+      <div class="apps-toolbar">
+        <label class="search">${icon("search")}<span class="sr-only">Search apps</span><input class="input" id="apps-q" type="search" placeholder="Search apps" autocomplete="off" spellcheck="false" /></label>
+        <div class="seg" id="apps-sort" role="group" aria-label="Sort apps"></div>
+        <span class="apps-count num" id="apps-count"></span>
+      </div>
+      <div class="items apps-list" id="apps-list"></div>`)) $("#apps-q").value = A.q;
+  // No other leftovers screen while an uninstaller runs: its result opens this app's leftovers.
+  host.querySelector('[data-action="orphans"]').disabled = !!A.busy;
+
+  const n = A.notice;
+  const tone = { bad: ["is-danger", "circle-alert"], ok: ["is-ok", "circle-check"] }[n?.tone] || ["is-warn", "triangle-alert"];
+  patch($("#apps-notice"), n ? `<div class="note ${tone[0]} apps-notice">${icon(tone[1])}<span class="note-title">${esc(n.title)}</span>
+      <span class="note-text">${esc(n.text || "")}</span>${n.appId ? `<button class="btn sm" data-action="app-leftovers" data-id="${esc(n.appId)}">Look for leftovers</button>` : ""}</div>` : "");
+  patch($("#apps-sort"), [["name", "Name"], ["size", "Size"], ["date", "Installed"]].map(([k, l]) => `<button data-action="apps-sort" data-v="${k}" aria-pressed="${A.sort === k}">${l}</button>`).join(""));
+
+  const list = $("#apps-list");
+  list.classList.toggle("is-empty", A.status === "error");
+  if (A.status === "error") {
+    patch($("#apps-count"), "");
+    return patch(list, `<div class="empty">${icon("circle-alert")}<h2 class="h3">Couldn't list your apps</h2><p>${esc(A.error)}</p><div class="actions"><button class="btn" data-action="apps-reload">Try again</button></div></div>`);
+  }
+  if (A.status !== "ready" && !A.list.length) {
+    patch($("#apps-count"), "");
+    return patch(list, Array.from({ length: 6 }, () => `<div class="item app-row"><span class="app-mark"></span><span class="item-name"><span class="skeleton" style="width:180px"></span></span><span class="item-desc"><span class="skeleton" style="width:240px"></span></span></div>`).join(""));
+  }
+  const apps = visibleApps();
+  const total = A.list.reduce((s, a) => s + (a.size || 0), 0);
+  patch($("#apps-count"), A.q.trim() ? `${fmtInt(apps.length)} of ${fmtInt(A.list.length)} apps` : `${fmtInt(A.list.length)} apps · ${fmtBytes(total)}`);
+  list._h = undefined;
+  if (!apps.length) {
+    list.innerHTML = `<div class="apps-none">${A.list.length ? `No apps match “${esc(A.q.trim())}”.` : "No desktop apps were found."}</div>`;
+    return;
+  }
+  patchKeyed(list, apps.map((a) => [a.id, appRowHTML(a)]));
+  hydrateAppIcons();
+}
+
+function appRowHTML(a) {
+  const A = S.apps;
+  const waiting = A.busy === a.id;
+  const meta = [a.publisher, a.version && `Version ${a.version}`, a.installDate && `Installed ${shortDate(a.installDate)}`].filter(Boolean).join(" · ");
+  const initial = (a.name.match(/[\p{L}\p{N}]/u)?.[0] || "?").toUpperCase();
+  let side;
+  if (waiting) side = `<span class="item-state">${icon("loader-circle", "spin")} Waiting for the uninstaller…</span><button class="link-btn" data-action="app-stop-wait">Stop waiting</button>`;
+  else if (a.broken) side = `<button class="btn sm" data-action="app-leftovers" data-id="${esc(a.id)}" ${A.busy ? "disabled" : ""}>Remove leftovers</button>`;
+  else side = `<button class="btn sm" data-action="app-uninstall" data-id="${esc(a.id)}" ${A.busy || !a.canUninstall ? "disabled" : ""}>Uninstall</button>`;
+  return `<div class="item app-row${waiting ? " is-busy" : ""}">
+    <span class="app-mark" aria-hidden="true" data-appicon="${esc(a.id)}">${esc(initial)}</span>
+    <span class="item-name">${esc(a.name)}${a.broken ? `<span class="chip is-warn" title="Its uninstaller is gone. Platter can still remove what's left of it.">${icon("triangle-alert")}Uninstaller missing</span>` : ""}</span>
+    <div class="item-side app-side"><span class="item-size">${a.size ? fmtBytes(a.size) : `<span class="muted" title="This app doesn't report its size">—</span>`}</span>${side}</div>
+    <span class="item-desc">${esc(meta)}</span>
+  </div>`;
+}
+
+async function uninstallApp(id) {
+  const A = S.apps;
+  const a = A.list.find((x) => x.id === id);
+  if (!a || A.busy) return;
+  const ok = await dialog({
+    title: `Uninstall ${a.name}?`,
+    body: `<p>${esc(a.name)}'s own uninstaller will open. Follow its steps.</p><p>When it's finished, Platter looks for anything it left behind (folders, settings, services and scheduled tasks) and lets you choose what to remove.</p>`,
+    confirm: "Uninstall",
+  });
+  if (!ok || A.busy) return;
+  A.busy = id; A.notice = null;
+  rerenderApps();
+  let r = null, err = null;
+  try { r = await invoke("app_uninstall", { id }); } catch (e) { err = errText(e); }
+  A.busy = null;
+  if (err) {
+    // A missing uninstaller can still be cleaned up after; a cancelled one can be tried again.
+    A.notice = { tone: "bad", title: err, appId: /missing/i.test(err) ? id : null, name: a.name };
+    rerenderApps();
+    return;
+  }
+  await loadApps(true);
+  if (r.removed) {
+    A.list = A.list.filter((x) => x.id !== id); // its entry is gone, even if the reload didn't run
+    toast(`${a.name} was uninstalled.`);
+    // Never replace a leftovers screen the user is working in (a confirm may be open on it).
+    if (A.left) A.notice = { tone: "ok", title: `${a.name} was uninstalled.`, text: "Look for anything it left behind when you're ready.", appId: id, name: a.name };
+    else openLeftovers({ appId: id, name: a.name });
+  } else {
+    A.notice = {
+      tone: "warn", title: `${a.name} still looks installed.`, appId: id, name: a.name,
+      text: r.stoppedWaiting ? "Platter stopped waiting. If its uninstaller is still open, finish it, then look for leftovers." : "If you cancelled its uninstaller, nothing was removed.",
+    };
+    rerenderApps();
+  }
+}
+
+// App icons load as rows scroll into view and are kept for the session. The letter tile stays
+// for apps without one (command-line tools, drivers). The row HTML never contains the icon, so a
+// row rebuilt by patchKeyed just gets it back from the cache.
+const appIconCache = new Map(); // id -> data URL | "" (none) | Promise
+let appIconObserver = null;
+function hydrateAppIcons() {
+  const els = $$(".app-mark[data-appicon]:not(.has-icon)");
+  if (!els.length) return;
+  appIconObserver ||= new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) { appIconObserver.unobserve(e.target); loadAppIcon(e.target); }
+  }, { root: $("#main"), rootMargin: "400px" });
+  for (const el of els) {
+    const url = appIconCache.get(el.dataset.appicon);
+    if (typeof url === "string") setAppIcon(el, url); else appIconObserver.observe(el);
+  }
+}
+function setAppIcon(el, url) {
+  if (!url) return;
+  el.classList.add("has-icon");
+  el.innerHTML = `<img src="${esc(url)}" alt="" decoding="async" />`;
+}
+async function loadAppIcon(el) {
+  const id = el.dataset.appicon;
+  let p = appIconCache.get(id);
+  if (p == null) { p = invoke("app_icon", { id }).then((u) => u || "", () => ""); appIconCache.set(id, p); }
+  const url = await p;
+  appIconCache.set(id, url);
+  if (el.isConnected) setAppIcon(el, url);
+}
+
+/* ---------- Leftovers (one app's, or apps already removed) ---------- */
+
+const LEFT_GROUPS = [
+  ["files", "Folders and files", ["folder", "file"]],
+  ["registry", "Registry entries", ["registry", "uninstall-entry"]],
+  ["services", "Services", ["service"]],
+  ["tasks", "Scheduled tasks", ["task"]],
+  ["startup", "Startup entries", ["startup"]],
+];
+const LEFT_ICON = { folder: "folder", file: "file", registry: "key-round", "uninstall-entry": "package", service: "settings-2", task: "calendar-clock", startup: "power" };
+const CONFIDENCE = {
+  high: ["Belongs to it", "is-pine", "Platter is confident this belongs to the app."],
+  medium: ["Probably", "", "This matches the app, but less certainly. Check the path before removing it."],
+  low: ["Unsure", "is-warn", "A weak match. Only remove it if you recognise it."],
+};
+const leftLocked = (it) => it.needsAdmin && !S.sys.elevated;
+
+async function openLeftovers({ appId = null, name = null } = {}) {
+  const A = S.apps;
+  // Still installed (its uninstaller was cancelled or is still open, or it was never run): what it
+  // would leave behind includes its live install folder and the services running from it, so
+  // nothing is picked for the user. An app whose uninstaller is missing counts as gone.
+  const installed = !!appId && A.list.some((a) => a.id === appId && !a.broken);
+  const L = { status: "loading", appId, name, installed, items: [], sel: new Set(), states: {}, result: null, error: null, scanId: 0 };
+  A.left = L; A.notice = null;
+  if (isCleanSub("apps")) render({ resetScroll: true });
+  try {
+    const scan = appId ? await invoke("app_leftovers", { id: appId }) : await invoke("orphan_leftovers");
+    if (A.left !== L) return;
+    L.scanId = scan.scanId; L.items = scan.items || []; L.status = "ready";
+    if (scan.app) L.name = scan.app;
+    L.sel = new Set(installed ? [] : L.items.filter((it) => it.defaultOn && !leftLocked(it)).map((it) => it.id));
+  } catch (e) {
+    if (A.left !== L) return;
+    L.status = "error"; L.error = errText(e);
+  }
+  rerenderApps();
+}
+
+function leftSelected() {
+  const L = S.apps.left;
+  return L ? L.items.filter((it) => L.sel.has(it.id) && !leftLocked(it) && !L.states[it.id]?.ok) : [];
+}
+
+function updateLeftovers(host) {
+  const L = S.apps.left;
+  patch($("#clean-head"), "");
+  const title = !L.appId ? "Leftovers from apps you already removed" : L.installed ? `What belongs to ${L.name || "the app"}` : `What ${L.name || "the app"} left behind`;
+  frame(host, `left-${L.appId ?? "orphans"}-${L.scanId}`, `
+    <div class="left-top"><button class="link-btn back" data-action="left-back">${icon("arrow-left")}All apps</button></div>
+    <h2 class="section-title left-title" id="left-title"></h2>
+    <p class="section-sub left-sub">Folders and files go to the Recycle Bin. Registry entries, services and scheduled tasks are saved to a backup folder before they're removed.</p>
+    <section class="clean-summary" id="left-summary"></section>
+    <div id="left-notices"></div>
+    <div class="groups" id="left-groups"></div>`);
+  patch($("#left-title"), esc(title));
+
+  const groups = $("#left-groups");
+  if (L.status === "loading") {
+    patch($("#left-summary"), "");
+    patch($("#left-notices"), "");
+    return patch(groups, `<div class="progress-block" aria-live="polite"><div class="run-head"><h2 class="section-title">${icon("loader-circle", "spin")} Looking for leftovers…</h2></div><p class="muted" style="margin:0">Checking program folders, app data, the registry, services, scheduled tasks and startup entries.</p></div>`);
+  }
+  if (L.status === "error") {
+    patch($("#left-summary"), "");
+    patch($("#left-notices"), "");
+    return patch(groups, `<div class="empty">${icon("circle-alert")}<h2 class="h3">Couldn't look for leftovers</h2><p>${esc(L.error)}</p><div class="actions"><button class="btn" data-action="left-retry">Try again</button><button class="btn ghost" data-action="left-back">Back to apps</button></div></div>`);
+  }
+  if (!L.items.length) {
+    patch($("#left-summary"), "");
+    patch($("#left-notices"), "");
+    return patch(groups, `<div class="empty">${icon("circle-check")}<h2 class="h3">Nothing left behind</h2><p>${L.appId ? `Platter found no folders, settings, services or tasks left from ${esc(L.name || "this app")}.` : "Platter found nothing left over from apps that were removed."}</p><div class="actions"><button class="btn" data-action="left-back">Back to apps</button></div></div>`);
+  }
+  patch($("#left-summary"), leftSummaryHTML());
+  const locked = L.items.filter((it) => leftLocked(it) && !L.states[it.id]?.ok);
+  const r = L.result;
+  patch($("#left-notices"), `${L.installed ? `<div class="note is-warn" style="margin:-8px 0 24px">${icon("triangle-alert")}<span class="note-title">${esc(L.name || "This app")} is still installed.</span>
+      <span class="note-text">This list can include its install folder and the services and tasks it runs, so removing them can break it. Nothing is selected for you. To remove the app, uninstall it first.</span></div>` : ""}
+    ${locked.length ? `<div class="admin-callout" style="margin:-8px 0 24px"><div>${icon("lock")}<span>${fmtInt(locked.length)} ${locked.length === 1 ? "item needs" : "items need"} administrator rights to remove (machine-wide folders, registry entries, services or tasks).</span></div><button class="btn sm" data-action="elevate">Restart as administrator</button></div>` : ""}
+    ${r ? `<div class="note ${r.failed ? "is-warn" : "is-ok"}" style="margin:-8px 0 24px">${icon(r.failed ? "triangle-alert" : "circle-check")}<span class="note-title">Removed ${fmtInt(r.removed)} ${r.removed === 1 ? "item" : "items"}${r.freed ? ` and freed ${fmtBytes(r.freed)}` : ""}.</span>
+      <span class="note-text">${r.failed ? `${fmtInt(r.failed)} couldn't be removed. The reason is shown next to each one.` : "Folders and files are in the Recycle Bin."}${r.backupFolder ? " A backup of the registry entries, services and tasks was saved." : ""}</span>
+      ${r.backupFolder ? `<button class="btn sm" data-action="open-path" data-path="${esc(r.backupFolder)}">${icon("archive")}Open backup</button>` : ""}</div>` : ""}`);
+
+  groups._h = undefined;
+  const present = LEFT_GROUPS.filter(([, , kinds]) => L.items.some((it) => kinds.includes(it.kind)));
+  patchKeyed(groups, present.map(([key, label]) => [key, `<section><div class="group-title"><h2 class="h3">${label}</h2><span class="g-size"></span></div><div class="items"></div></section>`]));
+  for (const sec of groups.children) {
+    const kinds = LEFT_GROUPS.find(([k]) => k === sec.dataset.key)[2];
+    const its = L.items.filter((it) => kinds.includes(it.kind));
+    const size = its.reduce((s, it) => s + (it.size || 0), 0);
+    patch(sec.querySelector(".g-size"), size ? fmtBytes(size) : `${fmtInt(its.length)} ${its.length === 1 ? "entry" : "entries"}`);
+    patchKeyed(sec.querySelector(".items"), its.map((it) => [it.id, leftItemHTML(it)]));
+  }
+}
+
+function leftSummaryHTML() {
+  const L = S.apps.left;
+  const sel = leftSelected();
+  const size = sel.reduce((s, it) => s + (it.size || 0), 0);
+  const left = L.items.filter((it) => !L.states[it.id]?.ok).length;
+  const removing = L.status === "removing";
+  return `<div><div class="readout"><span class="big">${fmtInt(sel.length)}</span><span class="of">of ${fmtInt(left)} selected${size ? ` · ${fmtBytes(size)}` : ""}</span></div></div>
+    <button class="btn primary lg" data-action="left-remove" ${!sel.length || removing ? "disabled" : ""}>${removing ? icon("loader-circle", "spin") + "Removing…" : icon("trash-2") + `Remove ${sel.length || ""} ${sel.length === 1 ? "item" : "items"}`}</button>`;
+}
+
+function leftItemHTML(it) {
+  const L = S.apps.left;
+  const locked = leftLocked(it);
+  const st = L.states[it.id];
+  const conf = [...(CONFIDENCE[it.confidence] || CONFIDENCE.low)];
+  // Orphans belong to no app on the list, so "Belongs to it" would read oddly there.
+  if (!L.appId && it.confidence === "high") conf[0] = "Left over";
+  const disabled = locked || L.status === "removing" || st?.ok;
+  let state = "";
+  if (st?.ok) state = `<span class="item-state is-ok">${icon("check")} Removed</span>`;
+  else if (st?.error) state = `<span class="item-state is-bad">${esc(st.error)}</span>`;
+  else if (L.status === "removing" && L.sel.has(it.id) && !locked) state = `<span class="item-state">${icon("loader-circle", "spin")} Removing…</span>`;
+  return `<label class="item left-item ${locked ? "is-locked" : ""} ${st?.ok ? "is-done" : ""}">
+    <input type="checkbox" class="check" data-action="toggle-left" data-id="${esc(it.id)}" ${L.sel.has(it.id) && !st?.ok && !locked ? "checked" : ""} ${disabled ? "disabled" : ""} aria-describedby="ld-${esc(it.id)}" />
+    <span class="item-name">${icon(LEFT_ICON[it.kind] || "file")}<span class="left-label">${esc(it.label)}</span><span class="chip ${conf[1]}" title="${esc(conf[2])}">${conf[0]}</span>${locked ? `<span class="chip is-warn" title="Needs administrator rights">${icon("lock")}Admin</span>` : ""}</span>
+    <div class="item-side">${it.size ? `<span class="item-size">${fmtBytes(it.size)}</span>` : ""}${state}</div>
+    <span class="item-desc" id="ld-${esc(it.id)}"><span class="left-path" title="${esc(it.path)}">${esc(it.path)}</span><span>${esc(it.reason)}</span></span>
+  </label>`;
+}
+
+async function removeLeftovers() {
+  const L = S.apps.left;
+  if (!L || L.status !== "ready") return;
+  const its = leftSelected();
+  if (!its.length) return;
+  const files = its.filter((it) => it.kind === "folder" || it.kind === "file").length;
+  const other = its.length - files;
+  const lines = [];
+  if (L.installed) lines.push(`<p><b>${esc(L.name || "This app")} is still installed.</b> Removing parts of it can stop it working.</p>`);
+  if (files) lines.push(`<p>${fmtInt(files)} ${files === 1 ? "folder or file goes" : "folders and files go"} to the Recycle Bin.</p>`);
+  if (other) lines.push(`<p>${fmtInt(other)} ${other === 1 ? "registry entry, service or task is" : "registry entries, services or tasks are"} saved to a backup folder first, then removed.</p>`);
+  const ok = await dialog({ title: `Remove ${fmtInt(its.length)} ${its.length === 1 ? "item" : "items"}?`, body: lines.join(""), confirm: "Remove", tone: L.installed ? "danger" : "primary" });
+  if (!ok || S.apps.left !== L || L.status !== "ready") return;
+  L.status = "removing"; L.result = null;
+  for (const it of its) delete L.states[it.id];
+  rerenderApps();
+  try {
+    const r = await invoke("leftovers_remove", { scanId: L.scanId, ids: its.map((it) => it.id) });
+    for (const x of r.items || []) L.states[x.id] = { ok: x.ok, error: x.error };
+    L.result = r;
+    for (const it of its) if (L.states[it.id]?.ok) L.sel.delete(it.id);
+    toast(r.failed ? `Removed ${fmtInt(r.removed)} of ${fmtInt(its.length)} items.` : `Removed ${fmtInt(r.removed)} ${r.removed === 1 ? "item" : "items"}.`, r.freed ? { action: "Open Recycle Bin", onAction: () => invoke("open_recycle_bin") } : {});
+  } catch (e) { toast(errText(e), { tone: "bad" }); }
+  L.status = "ready";
+  rerenderApps();
+  loadVolumes().then(() => renderRail());
+  if (S.apps.status === "ready") loadApps(true); // an uninstall entry may be gone now
+}
+
+/* ---------- Duplicates ---------- */
+
+const DUPES_KEY = "platter.dupes";
+const DUPES_PHASE = { listing: "Finding files", hashing: "Comparing contents", images: "Comparing photos", videos: "Comparing videos", folders: "Comparing folders" };
+const MIN_SIZES = [[100 * 1024, "100 KB"], [1024 * 1024, "1 MB"], [10 * 1024 * 1024, "10 MB"], [100 * 1024 * 1024, "100 MB"]];
+const DEFAULT_OPTS = { minSize: 1024 * 1024, similarImages: true, similarVideos: true, folders: true };
+
+function saveDupePrefs() {
+  const D = S.dupes;
+  lsSet(DUPES_KEY, JSON.stringify({ off: D.roots ? D.roots.filter((r) => !D.picked.has(r.path)).map((r) => r.path) : [], custom: D.custom, opts: D.opts }));
+}
+
+let rootsLoading = false;
+async function loadDupeRoots() {
+  const D = S.dupes;
+  if (!D.opts) {
+    let p = null;
+    try { p = JSON.parse(lsGet(DUPES_KEY) || "null"); } catch {}
+    D.opts = { ...DEFAULT_OPTS, ...(p?.opts || {}) };
+    D.custom = Array.isArray(p?.custom) ? p.custom.filter((x) => typeof x === "string") : [];
+    D.off = new Set(Array.isArray(p?.off) ? p.off : []);
+  }
+  if (D.roots || rootsLoading) return;
+  rootsLoading = true;
+  try { D.roots = await invoke("dupes_default_roots"); } catch { D.roots = []; }
+  rootsLoading = false;
+  D.picked = new Set(D.roots.filter((r) => !D.off.has(r.path)).map((r) => r.path));
+  rerenderDupes();
+}
+function rerenderDupes() { if (isCleanSub("dupes")) render(); }
+
+function dupeRoots() {
+  const D = S.dupes;
+  return [...(D.roots || []).filter((r) => D.picked?.has(r.path)).map((r) => r.path), ...D.custom];
+}
+
+async function startDupes() {
+  const D = S.dupes;
+  if (D.status === "running") return;
+  const roots = dupeRoots();
+  if (!roots.length) return toast("Choose at least one folder to look in.", { tone: "bad" });
+  // D.scanId is the running scan's id (for its events). Deleting uses D.result.scanId, the scan
+  // the results on screen came from, which stays the latest one if this scan stops or fails.
+  D.status = "running"; D.scanId = null; D.early = []; D.error = null; D.lastDelete = null; D.cancelPending = false;
+  D.progress = { phase: "listing", files: 0, bytes: 0, done: 0, total: 0, current: "" };
+  render({ resetScroll: true });
+  try { D.scanId = await invoke("dupes_start", { roots, options: D.opts }); }
+  catch (e) { D.status = D.result ? "done" : "setup"; D.early = null; D.cancelPending = false; toast(errText(e), { tone: "bad" }); rerenderDupes(); return; }
+  // Stop was clicked while dupes_start was still checking the folders (before a scan existed to cancel).
+  if (D.cancelPending) { D.cancelPending = false; invoke("dupes_cancel").catch(() => {}); }
+  // Events can arrive before dupes_start returns its id: replay the ones for this scan.
+  const early = D.early || []; D.early = null;
+  for (const [kind, p] of early) dupesEvent(kind, p);
+}
+
+function dupesEvent(kind, p) {
+  const D = S.dupes;
+  if (D.status !== "running") return;
+  if (D.scanId == null) { D.early?.push([kind, p]); return; }
+  if (p.scanId !== D.scanId) return;
+  if (kind === "progress") onDupesProgress(p); else onDupesDone(p);
+}
+
+function onDupesProgress(p) {
+  const D = S.dupes;
+  D.progress = p;
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  set("dp-phase", DUPES_PHASE[p.phase] || "Working…");
+  set("dp-files", fmtInt(p.files)); set("dp-bytes", fmtBytes(p.bytes)); set("dp-current", p.current || "");
+  const bar = $("#dp-bar"), wrap = $("#dp-bar-wrap");
+  if (bar && wrap) {
+    const known = p.phase !== "listing" && p.total > 0;
+    wrap.classList.toggle("is-indeterminate", !known);
+    if (known) bar.style.width = `${Math.min(100, pct(p.done, p.total))}%`;
+  }
+}
+
+async function onDupesDone(d) {
+  const D = S.dupes;
+  if (!d.ok) {
+    D.status = d.cancelled ? (D.result ? "done" : "setup") : "error";
+    D.error = d.cancelled ? null : d.error || "The scan stopped unexpectedly.";
+    rerenderDupes();
+    return;
+  }
+  const id = d.scanId;
+  try {
+    const r = await invoke("dupes_result", { scanId: id });
+    if (D.scanId !== id) return;
+    D.result = r; D.finishedAt = Date.now(); D.shown = 120;
+    indexDupes();
+    D.sel = recommendedDupes();
+    D.section = ["files", "folders", "images", "videos"].find((s) => dupeSection(s).length) || "files";
+    D.status = "done";
+  } catch (e) { if (D.scanId !== id) return; D.status = "error"; D.error = errText(e); }
+  rerenderDupes();
+}
+
+function dupeSection(s) {
+  const r = S.dupes.result;
+  if (!r) return [];
+  return s === "files" ? r.groups : s === "folders" ? r.folders : s === "images" ? r.images : r.videos;
+}
+const groupMembers = (g) => g.folders || g.files; // folder groups also have `files` (a count)
+
+// path -> { size, gid, folder: bool, protected: bool } for every copy shown.
+function indexDupes() {
+  const D = S.dupes, idx = new Map();
+  for (const s of ["files", "folders", "images", "videos"]) {
+    for (const g of dupeSection(s)) for (const f of groupMembers(g)) idx.set(f.path, { size: f.size, gid: g.id, folder: s === "folders", protected: f.risk === "protected", section: s });
+  }
+  D.index = idx;
+  D.groups = new Map();
+  for (const s of ["files", "folders", "images", "videos"]) for (const g of dupeSection(s)) D.groups.set(g.id, g);
+}
+// Folder groups and file groups pick their keepers separately, so the recommended copies can
+// still add up to every copy of a file (a selected folder holding the file group's keeper).
+function recommendedDupes() {
+  const sel = new Set();
+  for (const s of ["files", "folders"]) for (const g of dupeSection(s)) for (const f of groupMembers(g)) if (f.select && f.risk !== "protected") sel.add(f.path);
+  return keepOneOfEach(sel).sel;
+}
+const lower = (p) => p.toLowerCase();
+const inside = (p, dir) => { const a = lower(p), b = lower(dir).replace(/\\+$/, ""); return a.startsWith(b + "\\"); };
+
+const sendable = (p) => { const x = S.dupes.index.get(p); return !!x && !x.protected; };
+const selectedFolders = (sel) => [...sel].filter((p) => sendable(p) && S.dupes.index.get(p).folder);
+
+// Selected copies, without the ones that sit inside a selected folder (counted once, sent once).
+function selectedDupes(sel = S.dupes.sel) {
+  const D = S.dupes;
+  const picks = [...sel].map((p) => ({ path: p, ...(D.index.get(p) || {}) })).filter((x) => x.gid && !x.protected);
+  const dirs = picks.filter((x) => x.folder).map((x) => x.path);
+  return picks.filter((x) => !dirs.some((d) => d !== x.path && inside(x.path, d)));
+}
+
+// Groups (of any kind) whose every copy this selection removes: selected, or inside a selected
+// folder copy. dupes_delete refuses the whole request if there is one.
+function groupsLosingEveryCopy(sel) {
+  const dirs = selectedFolders(sel);
+  const gone = (p) => (sel.has(p) && sendable(p)) || dirs.some((d) => inside(p, d));
+  return [...S.dupes.groups.values()].filter((g) => groupMembers(g).every((f) => gone(f.path)));
+}
+
+// The selection minus what it takes to leave a copy in every group. Per group, it frees the
+// first copy (keeper order) that is selected on its own, or else the keeper together with the
+// selected folder copies holding it. One pass is enough: unselecting never takes a copy away.
+function keepOneOfEach(sel) {
+  const out = new Set(sel), dropped = [];
+  let dirs = selectedFolders(out);
+  const gone = (p) => (out.has(p) && sendable(p)) || dirs.some((d) => inside(p, d));
+  for (const g of S.dupes.groups.values()) {
+    const ms = groupMembers(g);
+    if (!ms.every((f) => gone(f.path))) continue;
+    const free = ms.find((f) => out.has(f.path) && !dirs.some((d) => inside(f.path, d))) || ms[0];
+    for (const p of [free.path, ...dirs.filter((d) => inside(free.path, d))]) if (out.delete(p)) dropped.push(p);
+    dirs = dirs.filter((d) => out.has(d));
+  }
+  return { sel: out, dropped };
+}
+
+function updateDupes() {
+  const D = S.dupes;
+  const host = $("#dupes-body");
+  if (!host) return;
+  if (!D.opts) loadDupeRoots();
+  if (D.status === "running") return updateDupesRunning(host);
+  if (D.status === "done" && D.result) return updateDupesDone(host);
+  updateDupesSetup(host);
+}
+
+function updateDupesSetup(host) {
+  const D = S.dupes;
+  patch($("#clean-head"), D.result ? `<button class="btn" data-action="dupes-show">${icon("arrow-left")}Back to results</button>` : "");
+  frame(host, "setup", `<div id="dupes-error"></div>
+    <div class="dsetup">
+      <section class="dsetup-block"><h2 class="section-title">Where to look</h2><p class="section-sub">Your own folders are a good start. Add a drive to look everywhere; Windows and app folders on it are skipped.</p><div class="root-chips" id="dupes-roots"></div></section>
+      <section class="dsetup-block"><h2 class="section-title">What to find</h2><div class="opt-list" id="dupes-opts"></div></section>
+      <div class="dsetup-go" id="dupes-go"></div>
+    </div>`);
+  patch($("#dupes-error"), D.status === "error" ? `<div class="note is-danger" style="margin-bottom:20px">${icon("circle-alert")}<span class="note-title">The last scan didn't finish.</span><span class="note-text">${esc(D.error)}</span></div>` : "");
+  const roots = D.roots;
+  patch($("#dupes-roots"), roots == null ? `<span class="skeleton" style="width:320px;height:30px"></span>` : `
+    ${roots.map((r) => `<label class="root-chip"><input type="checkbox" class="check" data-root="${esc(r.path)}" ${D.picked.has(r.path) ? "checked" : ""} /><span title="${esc(r.path)}">${esc(r.label)}</span></label>`).join("")}
+    ${D.custom.map((p) => `<span class="root-chip is-custom">${icon("folder")}<span title="${esc(p)}">${esc(rootLabel(p))}</span><button class="root-x" data-action="dupes-remove-root" data-path="${esc(p)}" aria-label="Stop looking in ${esc(p)}" title="Remove">${icon("x")}</button></span>`).join("")}
+    <button class="btn sm" data-action="dupes-add-root">${icon("plus")}Add a folder or drive</button>`);
+  const o = D.opts || DEFAULT_OPTS;
+  const opt = (key, title, text) => `<label class="opt"><input type="checkbox" class="check" data-opt="${key}" ${o[key] ? "checked" : ""} /><span><b>${title}</b><span>${text}</span></span></label>`;
+  patch($("#dupes-opts"), `
+    <label class="opt is-fixed"><input type="checkbox" class="check" checked disabled /><span><b>Identical files</b><span>The same content byte for byte, whatever the file is called.</span></span></label>
+    ${opt("similarImages", "Similar photos", "Resized or re-saved copies and burst shots that look almost the same.")}
+    ${opt("similarVideos", "Similar videos", "The same clip saved at another size or quality.")}
+    ${opt("folders", "Duplicate folders", "Whole folders with the same files inside, like an old copy of a backup.")}
+    <div class="opt-size"><label for="dupes-min">Skip files smaller than</label><select class="select" id="dupes-min">${MIN_SIZES.map(([v, l]) => `<option value="${v}" ${o.minSize === v ? "selected" : ""}>${l}</option>`).join("")}</select></div>`);
+  const n = dupeRoots().length;
+  patch($("#dupes-go"), `<button class="btn primary lg" data-action="dupes-start" ${!n ? "disabled" : ""}>${icon("scan-search")}Find duplicates</button><span class="muted">${n ? "Nothing is removed until you choose." : "Choose at least one folder."}</span>`);
+}
+function rootLabel(p) {
+  if (/^[A-Za-z]:\\?$/.test(p)) { const v = vol(p[0].toUpperCase()); return v ? driveName(v) : `Drive ${p[0].toUpperCase()}:`; }
+  return p.replace(/\\+$/, "").split("\\").pop() || p;
+}
+
+function updateDupesRunning(host) {
+  const D = S.dupes, p = D.progress || {};
+  patch($("#clean-head"), "");
+  if (frame(host, "running", `<div class="progress-block" aria-live="polite">
+      <div class="run-head"><h2 class="section-title" id="dp-phase"></h2><button class="btn" data-action="dupes-cancel">${icon("x")}Stop</button></div>
+      <div class="progress-figs">
+        <div class="fig"><b id="dp-files"></b><span>files looked at</span></div>
+        <div class="fig"><b id="dp-bytes"></b><span>in those files</span></div>
+      </div>
+      <div class="bar is-indeterminate" id="dp-bar-wrap"><span id="dp-bar"></span></div>
+      <div class="current-path" id="dp-current"></div>
+      <p class="muted dp-hint">Platter reads only files that share a size with another file, so this goes faster than it looks.</p>
+    </div>`)) onDupesProgress(p);
+}
+
+function updateDupesDone(host) {
+  const D = S.dupes, r = D.result;
+  patch($("#clean-head"), `<span class="clean-age">Found ${esc(relTime(D.finishedAt))}</span><button class="btn" data-action="dupes-setup" ${D.deleting ? "disabled" : ""}>Change folders</button><button class="btn" data-action="dupes-start" ${D.deleting ? "disabled" : ""}>${icon("refresh-cw")}Scan again</button>`);
+  const nothing = !r.groups.length && !r.folders.length && !r.images.length && !r.videos.length;
+  frame(host, nothing ? "none" : "done", nothing ? `<div id="dupes-none"></div>` : `
+    <section class="clean-summary" id="dupes-summary"></section>
+    <div id="dupes-notices"></div>
+    <div class="dupes-bar"><div class="seg" id="dupes-sections" role="group" aria-label="Kinds of duplicates"></div><div class="dupes-sel" id="dupes-sel"></div></div>
+    <div class="dgroups" id="dupes-groups"></div>
+    <div id="dupes-more"></div>`);
+  const scanned = `Looked at ${fmtInt(r.files)} files (${fmtBytes(r.bytes)}) in ${listNames(r.roots.map(rootLabel))}.`;
+  if (nothing) {
+    return patch($("#dupes-none"), `<div class="empty">${icon("circle-check")}<h2 class="h3">No duplicates found</h2><p>${esc(scanned)} No file appears twice${D.opts?.similarImages ? ", and no photos look alike" : ""}.</p><div class="actions"><button class="btn" data-action="dupes-setup">Look somewhere else</button></div></div>`);
+  }
+  patch($("#dupes-summary"), dupesSummaryHTML());
+  const ld = D.lastDelete;
+  const skippedBits = [];
+  if (r.skipped.denied) skippedBits.push(`${fmtInt(r.skipped.denied)} ${r.skipped.denied === 1 ? "folder" : "folders"} Windows wouldn't open`);
+  if (r.skipped.cloud) skippedBits.push(`${fmtInt(r.skipped.cloud)} online-only ${r.skipped.cloud === 1 ? "file" : "files"}`);
+  patch($("#dupes-notices"), `${ld?.failed?.length ? `<div class="note is-warn" style="margin:-8px 0 20px">${icon("triangle-alert")}<span class="note-title">${fmtInt(ld.failed.length)} ${ld.failed.length === 1 ? "item was" : "items were"} left in place.</span><span class="note-text">${esc(ld.failed.slice(0, 3).map((f) => `${rootLabel(f.path)}: ${f.error}`).join(" "))}${ld.failed.length > 3 ? ` And ${fmtInt(ld.failed.length - 3)} more.` : ""}</span></div>` : ""}
+    <p class="dupes-scanned">${esc(scanned)}${skippedBits.length ? ` Skipped ${esc(listNames(skippedBits))}.` : ""}</p>`);
+  const sections = [["files", "Identical files"], ["folders", "Folders"], ["images", "Similar photos"], ["videos", "Similar videos"]].filter(([s]) => dupeSection(s).length);
+  if (!sections.some(([s]) => s === D.section)) D.section = sections[0][0];
+  patch($("#dupes-sections"), sections.map(([s, l]) => `<button data-action="dupes-section" data-v="${s}" aria-pressed="${D.section === s}">${l}<span class="count">${fmtInt(dupeSection(s).length)}</span></button>`).join(""));
+  patch($("#dupes-sel"), `<button class="link-btn" data-action="dupes-recommended" ${D.deleting ? "disabled" : ""}>Select recommended</button><button class="link-btn" data-action="dupes-clear" ${D.deleting || !D.sel.size ? "disabled" : ""}>Clear selection</button>`);
+  const list = dupeSection(D.section);
+  const shown = list.slice(0, D.shown);
+  const host2 = $("#dupes-groups");
+  host2.dataset.section !== D.section && (host2.innerHTML = "", host2.dataset.section = D.section);
+  patchKeyed(host2, shown.map((g) => [g.id, D.section === "images" || D.section === "videos" ? simGroupHTML(g) : dupGroupHTML(g, D.section === "folders")]));
+  patch($("#dupes-more"), list.length > shown.length ? `<div class="dupes-more"><button class="btn" data-action="dupes-more">Show ${fmtInt(Math.min(120, list.length - shown.length))} more</button><span class="muted">${fmtInt(list.length - shown.length)} more ${list.length - shown.length === 1 ? "group" : "groups"}</span></div>` : "");
+  hydrateThumbs();
+}
+
+function dupesSummaryHTML() {
+  const D = S.dupes, r = D.result;
+  const picks = selectedDupes();
+  const size = picks.reduce((s, x) => s + (x.size || 0), 0);
+  return `<div><div class="readout"><span class="big">${fmtBytes(size)}</span><span class="of">selected · ${fmtBytes(r.reclaimable)} recommended</span></div>
+      <p class="dupes-hint">Recommended copies are the extra ones in Downloads, Temp, or named like a copy. Similar photos and videos are never picked for you.</p></div>
+    <button class="btn primary lg" data-action="dupes-delete" ${!picks.length || D.deleting ? "disabled" : ""}>${D.deleting ? icon("loader-circle", "spin") + "Moving…" : icon("trash-2") + (picks.length ? `Move ${fmtInt(picks.length)} ${picks.some((x) => x.folder) ? (picks.length === 1 ? "item" : "items") : picks.length === 1 ? "copy" : "copies"} to Recycle Bin` : "Move to Recycle Bin")}</button>`;
+}
+
+function riskChip(f) {
+  if (f.keep) return `<span class="chip is-pine">${icon("check")}Keep</span>`;
+  if (f.risk === "protected") return `<span class="chip is-warn" title="Part of an app, game or project folder. Platter leaves it alone.">${icon("lock")}Leave</span>`;
+  return "";
+}
+
+function dupGroupHTML(g, isFolder) {
+  const D = S.dupes;
+  const members = groupMembers(g);
+  const names = new Set(members.map((f) => f.name.toLowerCase()));
+  const title = isFolder ? members[0].name : members[0].name;
+  const meta = isFolder
+    ? `${members.length} copies · ${fmtInt(g.files)} ${g.files === 1 ? "file" : "files"}, ${fmtBytes(g.size)} each`
+    : `${members.length} copies · ${fmtBytes(g.size)} each`;
+  return `<section class="dgroup">
+    <header class="dgroup-head">${isFolder ? icon("folder") : `<span class="cat-dot" style="background:${catVar(g.cat)}" title="${esc(CATS[g.cat] || "Other")}"></span>`}
+      <span class="dgroup-name">${esc(title)}${names.size > 1 ? `<span class="muted"> and ${names.size - 1} other ${names.size === 2 ? "name" : "names"}</span>` : ""}</span>
+      <span class="dgroup-meta num">${meta}</span></header>
+    <div class="dfiles">${members.map((f) => dupFileHTML(f, g, names.size > 1)).join("")}</div>
+  </section>`;
+}
+
+function dupFileHTML(f, g, showName) {
+  const D = S.dupes;
+  const prot = f.risk === "protected";
+  const checked = D.sel.has(f.path) && !prot;
+  return `<label class="dfile${checked ? " is-sel" : ""}">
+    <input type="checkbox" class="check" data-action="toggle-dupe" data-path="${esc(f.path)}" data-gid="${esc(g.id)}" ${checked ? "checked" : ""} ${prot || D.deleting ? "disabled" : ""} aria-label="Move ${esc(f.path)} to the Recycle Bin" />
+    <span class="dfile-main"><span class="dfile-path" title="${esc(f.path)}">${showName ? `<b>${esc(f.name)}</b> in ` : ""}${esc(f.folder)}</span>
+      <span class="dfile-note">${riskChip(f)}<span>${esc(f.note)}</span></span></span>
+    <span class="dfile-date num" title="Last changed">${f.modified ? esc(shortDate(f.modified)) : ""}</span>
+    <button class="btn sm icon ghost" data-action="reveal" data-path="${esc(f.path)}" title="Show in File Explorer" aria-label="Show ${esc(f.name)} in File Explorer">${icon("folder-open")}</button>
+  </label>`;
+}
+
+function simGroupHTML(g) {
+  const sims = g.files.filter((f) => !f.keep).map((f) => f.similarity);
+  const lo = Math.min(...sims), hi = Math.max(...sims);
+  const what = g.kind === "video" ? "videos" : "photos";
+  return `<section class="dgroup">
+    <header class="dgroup-head">${icon(g.kind === "video" ? "film" : "image")}<span class="dgroup-name">${g.files.length} similar ${what}</span>
+      <span class="dgroup-meta num">${sims.length ? (lo === hi ? `${lo}% alike` : `${lo}–${hi}% alike`) : ""}</span></header>
+    <div class="sim-grid">${g.files.map((f) => simTileHTML(f, g)).join("")}</div>
+  </section>`;
+}
+
+function fmtDuration(ms) {
+  const s = Math.round((ms || 0) / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}` : `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+function simTileHTML(f, g) {
+  const D = S.dupes;
+  const prot = f.risk === "protected";
+  const checked = D.sel.has(f.path) && !prot;
+  const dims = f.width && f.height ? `${f.width} × ${f.height}` : "";
+  const meta = [g.kind === "video" && f.durationMs != null ? fmtDuration(f.durationMs) : dims, fmtBytes(f.size)].filter(Boolean).join(" · ");
+  return `<label class="sim-tile${checked ? " is-sel" : ""}">
+    <span class="thumb" data-thumb="${esc(f.path)}">${icon(g.kind === "video" ? "film" : "image")}</span>
+    <span class="sim-row"><input type="checkbox" class="check" data-action="toggle-dupe" data-path="${esc(f.path)}" data-gid="${esc(g.id)}" ${checked ? "checked" : ""} ${prot || D.deleting ? "disabled" : ""} aria-label="Move ${esc(f.path)} to the Recycle Bin" />
+      <span class="sim-name" title="${esc(f.path)}">${esc(f.name)}</span></span>
+    <span class="sim-meta num">${esc(meta)}</span>
+    <span class="sim-meta">${f.keep ? `<span class="chip is-pine">${icon("check")}Best copy</span>` : prot ? riskChip(f) : `${f.similarity}% alike`}</span>
+    <span class="sim-meta sim-folder" title="${esc(f.folder)}">${esc(f.folder)}</span>
+  </label>`;
+}
+
+// Thumbnails load as tiles scroll into view and are kept for the session.
+const thumbCache = new Map();
+let thumbObserver = null;
+function hydrateThumbs() {
+  const els = $$(".thumb[data-thumb]:not(.has-img)");
+  if (!els.length) return;
+  thumbObserver ||= new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) { thumbObserver.unobserve(e.target); loadThumb(e.target); }
+  }, { root: $("#main"), rootMargin: "300px" });
+  for (const el of els) {
+    const url = thumbCache.get(el.dataset.thumb);
+    if (typeof url === "string") setThumb(el, url); else thumbObserver.observe(el);
+  }
+}
+function setThumb(el, url) {
+  if (!url) return;
+  el.classList.add("has-img");
+  el.innerHTML = `<img src="${esc(url)}" alt="" loading="lazy" decoding="async" />`;
+}
+async function loadThumb(el) {
+  const path = el.dataset.thumb;
+  let p = thumbCache.get(path);
+  if (!p) { p = invoke("dupes_thumb", { path }).catch(() => ""); thumbCache.set(path, p); }
+  const url = await p;
+  thumbCache.set(path, url);
+  if (el.isConnected) setThumb(el, url);
+}
+
+function toggleDupe(el) {
+  const D = S.dupes;
+  const path = el.dataset.path, g = D.groups?.get(el.dataset.gid);
+  if (!g) return;
+  if (el.checked) {
+    const next = new Set(D.sel); next.add(path);
+    // Selecting more only ever removes more, so a group newly losing every copy raises the count.
+    const lost = groupsLosingEveryCopy(next);
+    if (lost.length > groupsLosingEveryCopy(D.sel).length) {
+      el.checked = false; // the row's HTML is unchanged, so set the box back directly
+      const other = lost.find((x) => !groupMembers(x).some((f) => f.path === path));
+      toast(other ? `That would remove every copy of “${groupMembers(other)[0].name}”. Platter keeps at least one.` : "Platter keeps at least one copy. Unselect another copy first.", { tone: "bad" });
+      return;
+    }
+    D.sel.add(path);
+  } else D.sel.delete(path);
+  restoringFocus(() => {
+    patch($("#dupes-summary"), dupesSummaryHTML());
+    patch($("#dupes-sel"), `<button class="link-btn" data-action="dupes-recommended">Select recommended</button><button class="link-btn" data-action="dupes-clear" ${!D.sel.size ? "disabled" : ""}>Clear selection</button>`);
+    const host = $("#dupes-groups");
+    const sec = [...(host?.children || [])].find((c) => c.dataset.key === g.id);
+    if (sec) {
+      const html = D.section === "images" || D.section === "videos" ? simGroupHTML(g) : dupGroupHTML(g, D.section === "folders");
+      const n = fromHTML(html); n.dataset.key = g.id; n._h = html; sec.replaceWith(n);
+      hydrateThumbs();
+    }
+  });
+}
+
+async function deleteDupes() {
+  const D = S.dupes;
+  if (D.deleting || !D.result) return;
+  // Leave out whatever would remove every copy of something, rather than have the whole request refused.
+  const { sel, dropped } = keepOneOfEach(D.sel);
+  const picks = selectedDupes(sel);
+  if (!picks.length) {
+    if (dropped.length) toast("That's every copy there is. Platter keeps at least one, so unselect one copy.", { tone: "bad" });
+    return;
+  }
+  const size = picks.reduce((s, x) => s + (x.size || 0), 0);
+  const folders = picks.filter((x) => x.folder).length;
+  const what = folders === picks.length ? (folders === 1 ? "folder" : "folders") : folders ? "items" : picks.length === 1 ? "file" : "files";
+  const kept = dropped.length ? `<p>${fmtInt(dropped.length)} selected ${dropped.length === 1 ? "item stays" : "items stay"} where ${dropped.length === 1 ? "it is" : "they are"}, because with the rest ${dropped.length === 1 ? "it" : "they"} would remove every copy of a file.</p>` : "";
+  const ok = await dialog({
+    title: `Move ${fmtInt(picks.length)} ${what} to the Recycle Bin?`,
+    body: `<p>That's ${fmtBytes(size)}. You can restore them from the Recycle Bin; the space is freed when it's emptied.</p>${kept}<p>Platter keeps at least one copy of everything and skips any file that changed since the scan.</p>`,
+    confirm: "Move to Recycle Bin",
+  });
+  if (!ok || D.deleting || D.status !== "done" || !D.result) return;
+  // Delete against the results on screen: a later scan that was stopped or failed leaves them the latest.
+  const scanId = D.result.scanId;
+  D.sel = sel;
+  D.deleting = true; D.lastDelete = null;
+  rerenderDupes();
+  try {
+    const r = await invoke("dupes_delete", { scanId, paths: picks.map((x) => x.path) });
+    D.lastDelete = r;
+    if (r.removed) toast(`Moved ${fmtInt(r.removed)} ${r.removed === 1 ? "item" : "items"} (${fmtBytes(r.freed)}) to the Recycle Bin.`, { action: "Open Recycle Bin", onAction: () => invoke("open_recycle_bin") });
+    else if (r.failed?.length) toast("Nothing was moved. See the reasons below.", { tone: "bad" });
+    try { D.result = await invoke("dupes_result", { scanId }); indexDupes(); } catch {}
+    const failed = new Set((r.failed || []).map((f) => f.path));
+    D.sel = new Set([...D.sel].filter((p) => D.index.has(p) && failed.has(p)));
+  } catch (e) { toast(errText(e), { tone: "bad" }); }
+  D.deleting = false;
+  rerenderDupes();
+  loadVolumes().then(() => renderRail());
+}
+
 /* ------------------------------------------------------------------ events from Rust */
 
 function onScanProgress(p) {
@@ -1560,6 +2369,9 @@ listen("cleanup-progress", (p) => {
   if (S.route.view === "cleanup") { clearTimeout(S.cleanup.t); S.cleanup.t = setTimeout(render, 50); }
 });
 
+listen("dupes-progress", (p) => dupesEvent("progress", p));
+listen("dupes-done", (d) => dupesEvent("done", d));
+
 listen("drives-changed", async () => {
   const ident = (v) => `${v.serial}|${v.total}|${v.fileSystem}|${v.ready}|${v.status ?? ""}`;
   const beforeVols = new Map(S.volumes.map((v) => [v.letter, ident(v)]));
@@ -1585,7 +2397,7 @@ listen("drives-changed", async () => {
 const actions = {
   go: (el) => go({ view: el.dataset.view }),
   "go-drive": (el) => go({ view: "drive", letter: el.dataset.letter }),
-  "go-cleanup": () => go({ view: "cleanup" }),
+  "go-cleanup": () => go({ view: "cleanup", sub: "caches" }),
   "go-pc": () => go({ view: "pc" }),
   "tab-space": () => setTab("space"),
   "tab-optimize": () => setTab("optimize"),
@@ -1646,6 +2458,57 @@ const actions = {
   "reload-disks": async () => { S.disks = null; render(); await loadDisks(); render(); },
   "cleanup-analyze": () => { S.cleanup.lastResult = null; S.cleanup.states = {}; analyzeCleanup(); },
   "cleanup-run": () => runCleanup(),
+  "clean-sub": (el) => setCleanSub(el.dataset.sub),
+  "apps-reload": () => loadApps(true),
+  "apps-sort": (el) => { S.apps.sort = el.dataset.v; render(); },
+  orphans: () => { if (!S.apps.busy) openLeftovers(); },
+  "app-uninstall": (el) => uninstallApp(el.dataset.id),
+  "app-stop-wait": () => invoke("app_uninstall_stop_waiting").catch(() => {}),
+  "app-leftovers": (el) => {
+    const id = el.dataset.id;
+    const a = S.apps.list.find((x) => x.id === id);
+    openLeftovers({ appId: id, name: a?.name || (S.apps.notice?.appId === id ? S.apps.notice.name : null) });
+  },
+  "left-back": () => { S.apps.left = null; render({ resetScroll: true }); },
+  "left-retry": () => { const L = S.apps.left; if (L) openLeftovers({ appId: L.appId, name: L.name }); },
+  "left-remove": () => removeLeftovers(),
+  "toggle-left": (el) => {
+    const L = S.apps.left; if (!L) return;
+    if (el.checked) L.sel.add(el.dataset.id); else L.sel.delete(el.dataset.id);
+    const it = L.items.find((x) => x.id === el.dataset.id);
+    const row = el.closest(".item");
+    if (row && it) row._h = leftItemHTML(it); // the live checkbox already shows the new state
+    patch($("#left-summary"), leftSummaryHTML());
+  },
+  "dupes-start": () => startDupes(),
+  "dupes-cancel": (el) => {
+    const D = S.dupes;
+    if (D.status !== "running") return;
+    if (D.scanId == null) D.cancelPending = true; // no scan to stop yet: startDupes stops it once dupes_start returns
+    el.disabled = true; el.textContent = "Stopping…"; // the running frame is rebuilt for the next scan
+    invoke("dupes_cancel").catch(() => {});
+  },
+  "dupes-setup": () => { S.dupes.status = "setup"; render({ resetScroll: true }); },
+  "dupes-show": () => { if (S.dupes.result) { S.dupes.status = "done"; render({ resetScroll: true }); } },
+  "dupes-add-root": async () => {
+    const D = S.dupes;
+    try {
+      const dir = await T.dialog.open({ directory: true, multiple: false, title: "Choose a folder or drive to look in", defaultPath: S.sys.userProfile });
+      const p = Array.isArray(dir) ? dir[0] : dir;
+      if (!p) return;
+      const known = [...(D.roots || []).map((r) => r.path), ...D.custom].find((x) => x.toLowerCase() === p.toLowerCase());
+      if (known) { if (D.roots?.some((r) => r.path === known)) D.picked.add(known); }
+      else D.custom.push(p);
+      saveDupePrefs(); render();
+    } catch (e) { toast(errText(e), { tone: "bad" }); }
+  },
+  "dupes-remove-root": (el) => { const D = S.dupes; D.custom = D.custom.filter((p) => p !== el.dataset.path); saveDupePrefs(); render(); },
+  "dupes-section": (el) => { S.dupes.section = el.dataset.v; S.dupes.shown = 120; render(); },
+  "dupes-more": () => { S.dupes.shown += 120; render(); },
+  "dupes-recommended": () => { S.dupes.sel = recommendedDupes(); render(); },
+  "dupes-clear": () => { S.dupes.sel = new Set(); render(); },
+  "dupes-delete": () => deleteDupes(),
+  "toggle-dupe": (el) => toggleDupe(el),
   "toggle-item": (el) => {
     const C = S.cleanup; C.touched = true;
     if (el.checked) C.selected.add(el.dataset.id); else C.selected.delete(el.dataset.id);
@@ -1665,7 +2528,7 @@ document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-action]");
   if (!el || el.disabled) return;
   const a = el.dataset.action;
-  if (a === "toggle-item") { if (e.target !== el) return; return actions[a](el); }
+  if (a === "toggle-item" || a === "toggle-left" || a === "toggle-dupe") { if (e.target !== el) return; return actions[a](el); }
   // Row action buttons sit inside clickable rows: let the innermost one win.
   e.stopPropagation();
   actions[a]?.(el, e);
@@ -1681,7 +2544,8 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     if (e.repeat || dialogOpen) return;
     if (S.route.view === "drive") $("[data-action=refresh]")?.click();
-    else if (S.route.view === "cleanup") $("#clean-head [data-action=cleanup-analyze]:not([disabled])")?.click();
+    else if (isCleanSub("caches")) $("#clean-head [data-action=cleanup-analyze]:not([disabled])")?.click();
+    else if (isCleanSub("apps") && !S.apps.left && !S.apps.busy) loadApps(true);
     else if (S.route.view === "pc") refreshPC();
     return;
   }
@@ -1698,6 +2562,7 @@ async function refreshPC() {
 }
 
 document.addEventListener("input", (e) => {
+  if (e.target.id === "apps-q") { S.apps.q = e.target.value; updateApps(); return; }
   if (e.target.id === "label-input") {
     const v = vol(S.route.letter);
     const val = e.target.value;
@@ -1710,6 +2575,14 @@ document.addEventListener("input", (e) => {
 });
 document.addEventListener("change", (e) => {
   if (e.target.id === "letter-select" && S.route.letter) S.drafts.letter[S.route.letter] = e.target.value;
+  if (e.target.id === "ask-admin") setAskAdmin(e.target.checked);
+  const D = S.dupes;
+  if (e.target.dataset?.root != null && D.picked) {
+    if (e.target.checked) D.picked.add(e.target.dataset.root); else D.picked.delete(e.target.dataset.root);
+    saveDupePrefs(); render();
+  }
+  if (e.target.dataset?.opt && D.opts) { D.opts[e.target.dataset.opt] = e.target.checked; saveDupePrefs(); }
+  if (e.target.id === "dupes-min" && D.opts) { D.opts.minSize = Number(e.target.value) || DEFAULT_OPTS.minSize; saveDupePrefs(); }
 });
 
 document.addEventListener("submit", async (e) => {
@@ -1839,7 +2712,9 @@ async function boot() {
   if (hp.get("view") === "pc" || hp.get("view") === "cleanup") S.route = { view: hp.get("view") };
   if (hp.get("letter")) S.route.letter = hp.get("letter");
   if (hp.get("tab")) S.route.tab = hp.get("tab");
+  if (hp.get("sub") && S.route.view === "cleanup") S.route.sub = hp.get("sub");
   render();
+  if (S.route.view === "cleanup") { S.cleanSub = cleanSub(); if (S.cleanSub !== "caches") enterCleanSub(); }
   perf("js:first-render");
   requestAnimationFrame(() => requestAnimationFrame(() => { perf("js:first-paint"); sendReady(); }));
   // A hidden window may never produce a frame: show it once the DOM is built (with a safety net).
@@ -1847,6 +2722,11 @@ async function boot() {
   if (hp.get("scan")) startScan(`${S.route.letter}:\\`);
   if (hp.get("files")) setTimeout(() => { S.scan.view = "files"; renderPanel(); }, 4500);
   if (hp.get("optimize")) setTimeout(() => startOptimize(S.route.letter, hp.get("optimize")), 300);
+  const until = async (ok) => { for (let i = 0; i < 80 && !ok(); i++) await new Promise((r) => setTimeout(r, 100)); };
+  if (hp.get("leftovers")) until(() => S.apps.list.length).then(() => { const a = S.apps.list[0]; if (a) openLeftovers({ appId: a.id, name: a.name }); });
+  if (hp.get("orphans")) until(() => S.apps.status === "ready").then(() => openLeftovers());
+  if (hp.get("dupes")) until(() => S.dupes.roots).then(() => startDupes());
+  if (hp.get("section")) until(() => S.dupes.status === "done").then(() => { S.dupes.section = hp.get("section"); render(); });
 }
 
 // After the first paint: refresh cached data, maybe measure clean-up once idle, start polling.
@@ -1860,7 +2740,7 @@ function afterLaunch() {
     if (!changed || S.route.view !== "drive") return;
     if (S.route.tab === "overview") refreshOverviewBits(); else if (S.route.tab === "optimize") renderPanel();
   });
-  if (S.route.view === "cleanup" && !cleanupFresh()) idle(measureIfStale, 500); // the user is looking at it
+  if (isCleanSub("caches") && !cleanupFresh()) idle(measureIfStale, 500); // the user is looking at it
   else if (cleanupFresh(CLEANUP_REFRESH_MS)) perf("js:cleanup-cached");
   else { perf("js:cleanup-idle-scheduled"); scheduleIdleCleanup(3000); }
   try { if (localStorage.getItem(THEME_SYNC_KEY) !== getTheme()) syncThemePref(); } catch {}

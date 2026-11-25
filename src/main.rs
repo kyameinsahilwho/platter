@@ -1,13 +1,16 @@
 // Platter — see, clean, optimize and manage the disks on a Windows PC.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod appicon;
 mod cache;
 mod cleanup;
 mod disks;
+mod dupes;
 mod manage;
 mod optimize;
 mod perf;
 mod scan;
+mod uninstall;
 mod util;
 mod volumes;
 
@@ -23,6 +26,10 @@ use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Theme};
 #[serde(rename_all = "camelCase")]
 struct SystemInfo {
     elevated: bool,
+    /// Ask for administrator rights each time Platter starts (on unless the user turned it off).
+    /// `None` when this Platter runs elevated as another account: the setting lives in the desktop
+    /// user's profile, which this process can't see, so it can only be changed in standard mode.
+    ask_admin_at_start: Option<bool>,
     computer_name: String,
     system_drive: String,
     user_profile: String,
@@ -34,6 +41,7 @@ fn system_info() -> SystemInfo {
     let profile = util::env_path("USERPROFILE").unwrap_or_default();
     SystemInfo {
         elevated: util::is_elevated(),
+        ask_admin_at_start: (!cleanup::other_account()).then(util::ask_admin_at_start),
         computer_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
         system_drive: util::system_drive_letter(),
         downloads: profile.join("Downloads").to_string_lossy().into_owned(),
@@ -63,6 +71,23 @@ async fn relaunch_elevated(app: tauri::AppHandle) -> Result<bool, String> {
         app.exit(0);
     }
     Ok(ok)
+}
+
+/// Turn the startup administrator prompt on or off for the next launches.
+#[tauri::command]
+async fn set_ask_admin(enabled: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if cleanup::other_account() {
+            return Err("Platter is running as a different Windows account. Change this setting in standard mode.".to_string());
+        }
+        cache::write(util::ASK_ADMIN_KEY, &enabled);
+        if util::ask_admin_at_start() != enabled {
+            return Err("Platter couldn't save this setting.".into());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ------------------------------------------------------------------------------------- showing
@@ -357,12 +382,23 @@ fn main() {
     perf::mark("rust:main");
     // Polling empty card readers / optical drives must never pop "There is no disk in the drive".
     util::suppress_critical_error_dialogs();
-    // Started by relaunch_elevated: let the old instance (and its WebView2) go away first, then take
-    // over as the single instance even if its mutex handle hasn't been released yet.
+    // Started by relaunch_elevated: take over as the single instance at once (the old instance still
+    // holds the mutex, so it is never free in between), let the old instance know, then wait for it
+    // (and its WebView2) to go away before starting our own.
     let elevated_relaunch = util::wait_for_pid_arg(std::env::args().skip(1)).is_some();
-    util::wait_for_parent_from_args();
     if !util::claim_single_instance(elevated_relaunch) && util::defer_to_existing_instance() {
         perf::mark("rust:already-running");
+        return;
+    }
+    if elevated_relaunch {
+        util::note_taken_over();
+        util::wait_for_parent_from_args();
+        util::hold_instance_mutex();
+    }
+    // This is the one Platter: ask for administrator rights before any window or WebView exists.
+    // Accepted, the elevated copy takes over once this process has exited; declined, run standard.
+    if util::should_elevate_at_start(elevated_relaunch) && util::elevate_at_start() {
+        perf::mark("rust:elevated-at-start");
         return;
     }
 
@@ -439,6 +475,7 @@ fn main() {
             set_theme_pref,
             cache::cache_get_many,
             relaunch_elevated,
+            set_ask_admin,
             list_volumes,
             allocation_map,
             disks::list_disks,
@@ -461,6 +498,19 @@ fn main() {
             scan::scan_top_files,
             cleanup::cleanup_analyze,
             cleanup::cleanup_run,
+            uninstall::apps_list,
+            uninstall::app_icon,
+            uninstall::app_uninstall,
+            uninstall::app_uninstall_stop_waiting,
+            uninstall::app_leftovers,
+            uninstall::orphan_leftovers,
+            uninstall::leftovers_remove,
+            dupes::dupes_default_roots,
+            dupes::dupes_start,
+            dupes::dupes_cancel,
+            dupes::dupes_result,
+            dupes::dupes_thumb,
+            dupes::dupes_delete,
         ]))
         .run(tauri::generate_context!())
         .expect("error while running Platter");

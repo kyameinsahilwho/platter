@@ -2430,7 +2430,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platter"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "rayon",
  "serde",
@@ -2439,6 +2439,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "windows-sys 0.59.0",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -4693,6 +4694,12 @@ dependencies = [
  "once_cell",
  "pkg-config",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40de123dbb523ebcc00d61ec01840ad192578afc378d859f3429caa38308fad5"
 
 [[package]]
 name = "yoke"

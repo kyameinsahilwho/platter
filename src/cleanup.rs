@@ -1552,7 +1552,7 @@ impl TokenSid {
 /// True when Platter runs elevated as a different account than the one that owns the desktop
 /// (over-the-shoulder UAC). When that can't be confirmed either way while elevated, it says true,
 /// so per-user items are left alone rather than cleaning someone else's profile.
-fn other_account() -> bool {
+pub(crate) fn other_account() -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};

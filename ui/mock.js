@@ -11,11 +11,15 @@
 export const mockState = {
   usbPresent: true,
   elevated: false,
+  askAdmin: true, // "Ask at startup" switch (set_ask_admin)
   usbDisk: false, // also list the USB stick as physical disk 1 in list_disks
   dialogResult: "C:\\Users\\SKS\\Downloads", // what dialog.open resolves with (null = cancelled)
   noCache: false, // cache_get_many returns nothing (first launch)
   cleanupCacheAgeMin: 12, // age of the cached clean-up result (fresh under 30 minutes)
   themePref: null, // last set_theme_pref
+  apps: null, // installed apps (built lazily on first apps_list; uninstalling removes one)
+  uninstallCancel: false, // app_uninstall rejects as if the user declined the uninstaller / UAC
+  leftoverFail: false, // leftovers_remove fails the first folder ("open in another program")
 };
 
 /* ───────────────────────────── helpers ───────────────────────────── */
@@ -412,7 +416,7 @@ const C_SPEC = D("", 0, "sys", {
         ] }),
         D("Projects", g(13.1), "dev", { avg: 40e3, k: [
           D("platter", g(3.1), "dev", { k: [D("target", g(2.4), "dev", { avg: 300e3 })] }),
-          D("webwise-site", g(2.6), "dev", { k: [D("node_modules", g(2.0), "dev", { avg: 18e3, nd: 2400 }), D(".next", g(0.35), "dev")] }),
+          D("portfolio-site", g(2.6), "dev", { k: [D("node_modules", g(2.0), "dev", { avg: 18e3, nd: 2400 }), D(".next", g(0.35), "dev")] }),
           D("dashboard-app", g(3.9), "dev", { f: [["seed-dump.sql", m(410)]], k: [
             D("node_modules", g(1.9), "dev", { avg: 18e3, nd: 2100 }), D(".next", g(0.6), "dev"), D("dist", g(0.2), "dev"),
           ] }),
@@ -728,14 +732,534 @@ async function cleanupRun({ ids } = {}) {
   return { freed, deleted, skipped, items };
 }
 
+/* ───────────────────────────── uninstall apps ───────────────────────────── */
+
+const SAM = "C:\\Users\\Sam";
+const APPS_RAW = [
+  // [name, publisher, version, sizeMB (0 = unknown), installDate, scope, flags]
+  ["7-Zip 24.08 (x64)", "Igor Pavlov", "24.08", 5.6, "2025-03-14", "machine"],
+  ["Adobe Acrobat Reader", "Adobe", "24.005.20421", 612, "2025-08-02", "machine"],
+  ["Adobe Creative Cloud", "Adobe Inc.", "6.4.0.361", 1480, "2025-08-02", "machine"],
+  ["Audacity", "Audacity Team", "3.7.1", 98, "2025-11-09", "machine"],
+  ["Battle.net", "Blizzard Entertainment", "2.43.1", 0, "2025-06-21", "machine", { broken: true }],
+  ["Brave", "Brave Software, Inc.", "131.1.73.101", 640, "2026-02-17", "user"],
+  ["Discord", "Discord Inc.", "1.0.9175", 395, "2026-09-30", "user"],
+  ["Docker Desktop", "Docker Inc.", "4.36.0", 2860, "2026-04-18", "machine"],
+  ["Figma", "Figma, Inc.", "124.7.4", 410, "2026-05-30", "user"],
+  ["Git", "The Git Development Community", "2.47.1", 342, "2025-12-11", "machine"],
+  ["GIMP 2.10.38", "The GIMP Team", "2.10.38", 1120, "2025-10-05", "machine"],
+  ["Google Chrome", "Google LLC", "131.0.6778.205", 0, "2026-01-12", "machine"],
+  ["Inkscape", "Inkscape Project", "1.4", 560, "2025-09-14", "machine"],
+  ["Intel(R) Graphics Command Center", "Intel Corporation", "1.100.5001", 38, "2025-02-26", "machine"],
+  ["JetBrains Toolbox", "JetBrains s.r.o.", "2.5.2.35332", 186, "2026-03-03", "user"],
+  ["Logitech G HUB", "Logitech", "2024.11.667", 1240, "2025-07-19", "machine"],
+  ["Microsoft Edge", "Microsoft Corporation", "131.0.2903.112", 0, "2026-02-01", "machine"],
+  ["Microsoft Visual C++ 2015-2022 Redistributable (x64)", "Microsoft Corporation", "14.40.33816", 20.4, "2025-01-23", "machine"],
+  ["Mozilla Firefox (x64 en-US)", "Mozilla", "133.0.3", 241, "2026-03-27", "machine"],
+  ["Node.js", "Node.js Foundation", "22.12.0", 87, "2026-06-08", "machine"],
+  ["Notepad++ (64-bit x64)", "Notepad++ Team", "8.7.4", 14.2, "2026-08-22", "machine"],
+  ["NVIDIA Graphics Driver 566.36", "NVIDIA Corporation", "566.36", 1210, "2026-10-12", "machine"],
+  ["NVIDIA GeForce Experience", "NVIDIA Corporation", "3.28.0.417", 640, "2025-04-04", "machine"],
+  ["OBS Studio", "OBS Project", "30.2.3", 331, "2026-07-01", "machine"],
+  ["Old Game Launcher", "Retro Works Ltd", "1.3.0", 0, "2024-12-30", "machine", { broken: true }],
+  ["Opera Stable 115.0", "Opera Software", "115.0.5322.77", 0, "2026-09-02", "user"],
+  ["PuTTY release 0.82 (64-bit)", "Simon Tatham", "0.82.0.0", 7.3, "2025-05-16", "machine"],
+  ["Python 3.12.8 (64-bit)", "Python Software Foundation", "3.12.8150.0", 214, "2026-01-30", "user"],
+  ["Slack", "Slack Technologies Inc.", "4.41.105", 372, "2026-05-12", "user"],
+  ["Spotify", "Spotify AB", "1.2.52.442", 268, "2026-10-19", "user"],
+  ["Steam", "Valve Corporation", "2.10.91.91", 0, "2025-03-02", "machine"],
+  ["Visual Studio Code", "Microsoft Corporation", "1.96.2", 380, "2026-11-02", "user"],
+  ["VLC media player", "VideoLAN", "3.0.21", 168, "2026-04-04", "machine"],
+  ["WinRAR 7.01 (64-bit)", "win.rar GmbH", "7.01.0", 6.1, "2025-09-27", "machine"],
+  ["Zoom Workplace (64-bit)", "Zoom Communications, Inc.", "6.2.11 (49560)", 428, "2026-08-08", "user"],
+];
+function buildApps() {
+  return APPS_RAW.map(([name, publisher, version, mb, installDate, scope, f = {}], i) => {
+    const broken = !!f.broken;
+    const loc = scope === "user" ? `${SAM}\\AppData\\Local\\Programs\\${cleanName(name)}` : `C:\\Program Files\\${cleanName(name)}`;
+    return {
+      id: `${scope === "user" ? "HKCU" : "HKLM"}|64|app${String(i + 1).padStart(2, "0")}`,
+      name, publisher, version, installDate, size: Math.round(mb * 1048576),
+      installLocation: broken ? null : loc, scope, canUninstall: !broken, broken,
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+}
+// "Mozilla Firefox (x64 en-US)" -> "Mozilla Firefox"; "GIMP 2.10.38" -> "GIMP"
+function cleanName(n) {
+  return n.replace(/\s*\(.*?\)/g, "").replace(/\s+(release\s+)?v?\d+(\.\d+)+.*$/i, "").replace(/\s+Stable$/i, "").trim();
+}
+function getApps() {
+  if (!mockState.apps) mockState.apps = buildApps();
+  return mockState.apps;
+}
+const appsSeen = new Map(); // id -> snapshot (leftovers still work after the entry is gone)
+let uninstallRun = null;
+
+function appsList() {
+  const list = getApps();
+  for (const a of list) appsSeen.set(a.id, { ...a });
+  return list.map((a) => ({ ...a }));
+}
+
+// A stand-in app icon: a seeded coloured tile with a simple white mark, so the preview shows
+// icons offline. Broken apps and roughly one in six have none (the UI keeps the letter tile).
+function appIcon({ id } = {}) {
+  const app = appsSeen.get(id);
+  const h = hashStr(String(id));
+  if (!app || app.broken || h % 6 === 0) return null;
+  const hue = h % 360, shape = (h >> 9) % 3;
+  const mark = shape === 0 ? '<circle cx="32" cy="32" r="13" fill="#fff"/>'
+    : shape === 1 ? '<rect x="19" y="19" width="26" height="26" rx="6" fill="#fff"/>'
+    : '<path d="M32 16 48 46H16Z" fill="#fff"/>';
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl(${hue} 70% 58%)"/><stop offset="1" stop-color="hsl(${(hue + 40) % 360} 70% 42%)"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="14" fill="url(#g)"/>${mark}</svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+function appUninstall({ id } = {}) {
+  if (uninstallRun) throw "Another uninstaller is already running.";
+  const app = getApps().find((a) => a.id === id);
+  if (!app) throw "That app isn't installed any more. Refresh the list and try again.";
+  if (!app.canUninstall) throw "This app's uninstaller is missing. Look for leftovers to remove what's left of it.";
+  return new Promise((resolve, reject) => {
+    const run = { timer: null, finish: null };
+    uninstallRun = run;
+    run.finish = (stopped) => {
+      clearTimeout(run.timer);
+      uninstallRun = null;
+      if (stopped) return resolve({ removed: false, exitCode: null, stoppedWaiting: true });
+      if (mockState.uninstallCancel) return reject("The uninstaller was cancelled, so nothing was removed.");
+      mockState.apps = getApps().filter((a) => a.id !== id);
+      resolve({ removed: true, exitCode: 0, stoppedWaiting: false });
+    };
+    run.timer = setTimeout(() => run.finish(false), 2500);
+  });
+}
+
+function appUninstallStopWaiting() {
+  if (uninstallRun) uninstallRun.finish(true);
+}
+
+/* leftovers */
+
+let leftoverSeq = 0;
+let leftoverScan = null; // { scanId, app, items }
+const LO_TS = "2026-11-24 101500";
+
+function makeScan(app, items) {
+  const scanId = ++leftoverSeq;
+  items.forEach((it, i) => { it.id = `lo-${scanId}-${i + 1}`; });
+  leftoverScan = { scanId, app, items };
+  return { scanId, app, items: items.map((x) => ({ ...x })) };
+}
+const loItem = (kind, path, label, reason, size, confidence, needsAdmin = false) => ({
+  id: "", kind, path, label, reason, size, confidence, needsAdmin, defaultOn: confidence === "high",
+});
+
+function appLeftovers({ id } = {}) {
+  const app = getApps().find((a) => a.id === id) ?? appsSeen.get(id);
+  if (!app) throw "That app isn't in the list any more. Refresh the list and try again.";
+  const rnd = mulberry32(hashStr(app.id));
+  const name = cleanName(app.name);
+  const pub = (app.publisher || name).replace(/,? (Inc\.?|LLC|Ltd|GmbH|s\.r\.o\.|Corporation)$/i, "");
+  const machine = app.scope === "machine";
+  const mb = (a, b) => m(a + rnd() * (b - a));
+  const items = [
+    loItem("folder", app.installLocation ?? (machine ? `C:\\Program Files\\${name}` : `${SAM}\\AppData\\Local\\Programs\\${name}`),
+      name, "In the app's install folder.", app.size || mb(20, 300), "high"),
+    loItem("folder", `${SAM}\\AppData\\Roaming\\${name}`, name, "Named after the app.", mb(1, 120), "high"),
+    loItem("folder", `${SAM}\\AppData\\Local\\${name}\\Cache`, "Cache", "Named after the app.", mb(8, 700), "high"),
+    loItem("registry", `HKCU\\Software\\${pub}\\${name}`, name, "Settings the app saved for you.", 0, "high"),
+  ];
+  if (machine) items.push(loItem("registry", `HKLM\\SOFTWARE\\${pub}\\${name}`, name, "Settings the app saved for all users.", 0, "high", true));
+  else items.push(loItem("folder", `${SAM}\\AppData\\Local\\${name}\\User Data`, "User Data", "Named after the app.", mb(4, 240), "high"));
+  if (rnd() < 0.5) items.push(loItem("task", `\\${name} Update`, `${name} Update`, "A scheduled task named after the app.", 0, "medium", true));
+  if (rnd() < 0.4) items.push(loItem("service", `${name.replace(/\W+/g, "")}UpdateSvc`, `${name} Update Service`, "A service that runs the app's program file.", 0, "medium", true));
+  if (rnd() < 0.5) items.push(loItem("startup", `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run \u2192 ${name}`, name, "Starts the app when you sign in.", 0, "high"));
+  if (machine && rnd() < 0.75) items.push(loItem("folder", `C:\\ProgramData\\${name}`, name, "Might belong to this app; check before removing.", mb(0.5, 60), "low"));
+  return makeScan(app.name, items);
+}
+
+function orphanLeftovers() {
+  const items = [
+    loItem("uninstall-entry", "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OldGameLauncher_is1", "Old Game Launcher", "Its program and install folder are gone.", 0, "high", true),
+    loItem("service", "AdobeARMservice", "Adobe Acrobat Update Service", "Its program file is gone.", 0, "medium", true),
+    loItem("task", "\\GoogleUpdateTaskMachineCore", "GoogleUpdateTaskMachineCore", "Its program file is gone.", 0, "medium", true),
+    loItem("startup", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run \u2192 OneDriveSetup", "OneDriveSetup", "Its program file is gone.", 0, "high"),
+    loItem("folder", "C:\\Program Files (x86)\\Retro Works", "Retro Works", "No programs inside and nothing changed in 90 days.", m(412), "medium", true),
+    loItem("folder", "C:\\ProgramData\\Old Game Launcher", "Old Game Launcher", "No programs inside and nothing changed in 90 days.", m(86), "medium", true),
+    loItem("folder", `${SAM}\\AppData\\Local\\Programs\\Skype`, "Skype", "No programs inside and nothing changed in 90 days.", m(23), "medium"),
+    loItem("registry", "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\oldlauncher.exe", "oldlauncher.exe", "It points at a file that no longer exists.", 0, "medium", true),
+  ];
+  for (const it of items) if (it.kind === "folder") it.defaultOn = false;
+  return makeScan(null, items);
+}
+
+function leftoversRemove({ scanId, ids } = {}) {
+  if (!leftoverScan || leftoverScan.scanId !== scanId) throw "These results are out of date. Look for leftovers again.";
+  const out = [];
+  let removed = 0, failed = 0, freed = 0, backup = false;
+  let failUsed = false;
+  for (const id of ids ?? []) {
+    const it = leftoverScan.items.find((x) => x.id === id);
+    if (!it) { out.push({ id, ok: false, error: "That item is already gone." }); failed++; continue; }
+    if (it.needsAdmin && !mockState.elevated) {
+      out.push({ id, ok: false, error: "Needs administrator rights. Restart Platter as administrator and try again." });
+      failed++;
+      continue;
+    }
+    if (mockState.leftoverFail && !failUsed && it.kind === "folder") {
+      failUsed = true;
+      out.push({ id, ok: false, error: "This folder is open in another program. Close it and try again." });
+      failed++;
+      continue;
+    }
+    out.push({ id, ok: true, error: null });
+    removed++;
+    freed += it.size;
+    if (it.kind !== "folder" && it.kind !== "file") backup = true;
+    leftoverScan.items = leftoverScan.items.filter((x) => x !== it);
+  }
+  return {
+    removed, failed, freed, items: out,
+    backupFolder: backup ? `${SAM}\\AppData\\Local\\app.platter.disks\\backups\\${LO_TS} ${leftoverScan.app ?? "Orphans"}` : null,
+  };
+}
+
+/* ───────────────────────────── duplicates ───────────────────────────── */
+
+const DUPE_ROOTS = ["Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music"].map((l) => ({ path: `${SAM}\\${l}`, label: l }));
+// folders the recommendation rules treat as "app / project" (package.json, .exe+.dll, ...)
+const PROT_ROOTS = [`${SAM}\\Documents\\Projects\\portfolio-site`, `${SAM}\\Documents\\Backups\\portfolio-site backup`, `${SAM}\\Downloads\\Blender 4.2 portable`, `${SAM}\\Documents\\Projects\\dashboard-app`];
+const isProt = (p) => /\\(Windows|Program Files( \(x86\))?|ProgramData|AppData)\\/i.test(p) || PROT_ROOTS.some((r) => p.toLowerCase().startsWith(r.toLowerCase() + "\\") || p.toLowerCase() === r.toLowerCase());
+const isCopyName = (n) => / - Copy|\(\d+\)|^Copy of /i.test(n);
+const dirOf = (p) => p.slice(0, p.lastIndexOf("\\"));
+const baseOf = (p) => p.slice(p.lastIndexOf("\\") + 1);
+function rankOf(p) {
+  if (isProt(p)) return 0;
+  if (/\\(Pictures|Documents|Videos|Music)(\\|$)/i.test(p)) return 1;
+  if (/\\Desktop(\\|$)/i.test(p)) return 2;
+  if (/\\(Downloads|Temp)(\\|$)/i.test(p)) return 4;
+  return 3;
+}
+// top-level user folder of a path, for notes ("Pictures", "Downloads")
+function folderWhere(p) {
+  const f = dirOf(p).replace(SAM + "\\", "");
+  return f.split("\\")[0];
+}
+
+// copies: [{ path, size, daysAgo }] -> DupFile[] following the contract's recommendation rules
+function recommend(copies, selectable = true) {
+  const files = copies.map((c) => ({
+    path: c.path, name: baseOf(c.path), folder: dirOf(c.path), size: c.size,
+    modified: Date.now() - c.daysAgo * DAY, keep: false, select: false, risk: "review", note: "",
+  }));
+  files.sort((a, b) =>
+    rankOf(a.path) - rankOf(b.path) ||
+    Number(isCopyName(a.name)) - Number(isCopyName(b.name)) ||
+    a.modified - b.modified || a.path.length - b.path.length);
+  const keeper = files[0];
+  keeper.keep = true;
+  const oldest = Math.min(...files.map((x) => x.modified));
+  for (const f of files) {
+    const where = folderWhere(f.path);
+    if (isProt(f.path)) { f.risk = "protected"; f.note = "Part of an app's folder, so leave it"; }
+    else if (/\\(Downloads|Temp)(\\|$)/i.test(f.path)) { f.risk = "safe"; f.note = `Copy in ${where}`; }
+    else if (isCopyName(f.name)) { f.risk = "safe"; f.note = "Named like a copy"; }
+    else if (f.folder === keeper.folder) { f.risk = "safe"; f.note = "Same folder as the copy we keep"; }
+    else { f.risk = "review"; f.note = `Also in ${where}`; }
+    if (f.keep && f.risk !== "protected") f.note = `${f.modified === oldest ? "Oldest copy" : "Best copy"}, in ${where}`;
+    f.select = selectable && !f.keep && f.risk !== "protected";
+  }
+  return files;
+}
+
+function buildDupes(scan) {
+  const rnd = mulberry32(hashStr("dupes-v1"));
+  const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+  const o = scan.options;
+  const exact = [];
+  let gid = 0;
+  const addGroup = (copies) => {
+    const files = recommend(copies);
+    const size = copies[0].size;
+    exact.push({
+      id: `g${++gid}`, cat: catOf(files[0].name), size,
+      reclaimable: size * files.filter((f) => f.select).length, files,
+    });
+  };
+  // photos duplicated between Pictures and Downloads / " - Copy" names
+  for (let i = 0; i < 14; i++) {
+    const n = 2000 + ri(0, 7999);
+    const ext = ["jpg", "jpg", "heic", "png"][ri(0, 3)];
+    const size = ri(1800, 6200) * 1024;
+    const d = ri(40, 900);
+    const c = [{ path: `${SAM}\\Pictures\\Camera Roll\\IMG_${n}.${ext}`, size, daysAgo: d }];
+    if (i % 3 === 0) c.push({ path: `${SAM}\\Pictures\\Camera Roll\\IMG_${n} - Copy.${ext}`, size, daysAgo: d - 3 });
+    else c.push({ path: `${SAM}\\Downloads\\IMG_${n}.${ext}`, size, daysAgo: d - ri(1, 30) });
+    if (i % 5 === 0) c.push({ path: `${SAM}\\Desktop\\IMG_${n}.${ext}`, size, daysAgo: d - 10 });
+    addGroup(c);
+  }
+  // videos
+  [["Family Trip Goa 2026", "mp4", 842], ["Product Demo Final v3", "mp4", 410], ["Drone_DJI_0412", "mov", 296], ["Screen Recording 2026-09-21", "mp4", 188], ["Wedding Highlights 4K", "mp4", 655]].forEach(([n, ext, mb], i) => {
+    addGroup([
+      { path: `${SAM}\\Videos\\${n}.${ext}`, size: m(mb), daysAgo: 120 + i * 20 },
+      { path: `${SAM}\\Downloads\\${n} (1).${ext}`, size: m(mb), daysAgo: 60 + i * 5 },
+    ]);
+  });
+  // installers in Downloads x2-3
+  [["vlc-3.0.21-win64", "exe", 42], ["7z2408-x64", "exe", 1.6], ["node-v22.12.0-x64", "msi", 31], ["VSCodeUserSetup-x64-1.96.2", "exe", 110],
+   ["Docker Desktop Installer", "exe", 610], ["python-3.12.8-amd64", "exe", 27], ["GIMP-2.10.38-setup", "exe", 316], ["obs-studio-30.2.3-windows", "zip", 118]].forEach(([n, ext, mb], i) => {
+    const c = [
+      { path: `${SAM}\\Downloads\\${n}.${ext}`, size: m(mb), daysAgo: 30 + i * 9 },
+      { path: `${SAM}\\Downloads\\${n} (1).${ext}`, size: m(mb), daysAgo: 20 + i * 9 },
+    ];
+    if (i % 2 === 0) c.push({ path: `${SAM}\\Downloads\\Old\\${n}.${ext}`, size: m(mb), daysAgo: 200 + i });
+    addGroup(c);
+  });
+  // PDFs
+  ["Invoice_Oct", "Thesis_final_v7", "Lease Agreement 2026", "Tax Return 2025", "Client Contract Acme", "Resume Sam 2026", "Insurance Policy", "Quarterly Report FY26"].forEach((n, i) => {
+    const size = ri(90, 4800) * 1024;
+    const c = [
+      { path: `${SAM}\\Documents\\${i % 2 ? "Work" : "Invoices"}\\${n}.pdf`, size, daysAgo: 150 + i * 11 },
+      { path: `${SAM}\\Downloads\\${n}.pdf`, size, daysAgo: 100 + i * 7 },
+    ];
+    if (i % 3 === 0) c.push({ path: `${SAM}\\Desktop\\${n}.pdf`, size, daysAgo: 90 });
+    addGroup(c);
+  });
+  // protected copies inside project / app folders
+  addGroup([
+    { path: `${SAM}\\Documents\\Projects\\portfolio-site\\public\\img\\hero.jpg`, size: m(3.1), daysAgo: 240 },
+    { path: `${SAM}\\Pictures\\hero.jpg`, size: m(3.1), daysAgo: 200 },
+  ]);
+  addGroup([
+    { path: `${SAM}\\Documents\\Projects\\portfolio-site\\public\\logo.png`, size: 184320, daysAgo: 240 },
+    { path: `${SAM}\\Documents\\Projects\\portfolio-site\\src\\assets\\logo.png`, size: 184320, daysAgo: 238 },
+  ]);
+  addGroup([
+    { path: `${SAM}\\Documents\\Projects\\dashboard-app\\seed\\seed-dump.sql`, size: m(410), daysAgo: 70 },
+    { path: `${SAM}\\Documents\\Projects\\dashboard-app\\backup\\seed-dump.sql`, size: m(410), daysAgo: 71 },
+  ]);
+  addGroup([
+    { path: `${SAM}\\Downloads\\Blender 4.2 portable\\4.2\\python\\bin\\python311.dll`, size: m(5.8), daysAgo: 55 },
+    { path: `${SAM}\\Downloads\\Blender 4.2 portable\\blender.shared\\python311.dll`, size: m(5.8), daysAgo: 55 },
+  ]);
+  addGroup([
+    { path: `${SAM}\\Documents\\Projects\\portfolio-site\\docs\\spec.pdf`, size: m(1.4), daysAgo: 160 },
+    { path: `${SAM}\\Documents\\Work\\spec.pdf`, size: m(1.4), daysAgo: 150 },
+    { path: `${SAM}\\Downloads\\spec.pdf`, size: m(1.4), daysAgo: 149 },
+  ]);
+  const minSize = o.minSize | 0;
+  const groups = exact.filter((x) => x.size >= minSize).sort((a, b) => b.reclaimable - a.reclaimable);
+
+  // folder groups
+  const mkFolder = (id, size, files, copies) => {
+    const f = recommend(copies.map((c) => ({ ...c, size })));
+    return { id, size, files, reclaimable: size * f.filter((x) => x.select).length, folders: f };
+  };
+  const folders = !o.folders ? [] : [
+    mkFolder("f1", m(412), 48, [
+      { path: `${SAM}\\Pictures\\Holiday 2024`, daysAgo: 360 },
+      { path: `${SAM}\\Downloads\\Holiday 2024 (1)`, daysAgo: 330 },
+    ]),
+    mkFolder("f2", m(96), 1840, [
+      { path: `${SAM}\\Documents\\Projects\\portfolio-site`, daysAgo: 200 },
+      { path: `${SAM}\\Documents\\Backups\\portfolio-site backup`, daysAgo: 120 },
+    ]),
+    mkFolder("f3", m(238), 31, [
+      { path: `${SAM}\\Music\\Playlists\\Road Trip`, daysAgo: 400 },
+      { path: `${SAM}\\Desktop\\Copy of Road Trip`, daysAgo: 90 },
+    ]),
+  ].sort((a, b) => b.reclaimable - a.reclaimable);
+
+  // similar images / videos (never selected: similar isn't identical)
+  const similar = (kind, id, specs) => {
+    const files = recommend(specs.map((s) => ({ path: s.path, size: s.size, daysAgo: s.daysAgo })), false).map((f) => {
+      const s = specs.find((x) => x.path === f.path);
+      return { ...f, width: s.w, height: s.h, durationMs: kind === "video" ? s.dur : null, similarity: f.keep ? 100 : s.sim };
+    });
+    return { id, kind, files };
+  };
+  const images = !o.similarImages ? [] : [
+    similar("image", "i1", [
+      { path: `${SAM}\\Pictures\\Camera Roll\\DSC_4021.jpg`, size: m(7.2), daysAgo: 300, w: 6000, h: 4000, sim: 100 },
+      { path: `${SAM}\\Pictures\\Saved Pictures\\DSC_4021_edit.jpg`, size: m(2.4), daysAgo: 280, w: 3000, h: 2000, sim: 96 },
+      { path: `${SAM}\\Downloads\\DSC_4021_small.jpg`, size: 412000, daysAgo: 250, w: 1200, h: 800, sim: 92 },
+    ]),
+    similar("image", "i2", [
+      { path: `${SAM}\\Pictures\\panorama_ladakh_2026.jpg`, size: m(61), daysAgo: 90, w: 16384, h: 3200, sim: 100 },
+      { path: `${SAM}\\Desktop\\panorama_ladakh_preview.jpg`, size: m(1.8), daysAgo: 85, w: 4096, h: 800, sim: 97 },
+    ]),
+    similar("image", "i3", [
+      { path: `${SAM}\\Pictures\\Screenshots\\Screenshot 2026-10-01 101200.png`, size: m(1.1), daysAgo: 54, w: 1920, h: 1080, sim: 100 },
+      { path: `${SAM}\\Pictures\\Screenshots\\Screenshot 2026-10-01 101205.png`, size: m(1.1), daysAgo: 54, w: 1920, h: 1080, sim: 95 },
+      { path: `${SAM}\\Downloads\\Screenshot 2026-10-01 101210.png`, size: m(1.0), daysAgo: 54, w: 1920, h: 1080, sim: 90 },
+      { path: `${SAM}\\Desktop\\Screenshot 2026-10-01 101215.png`, size: m(1.0), daysAgo: 53, w: 1920, h: 1080, sim: 88 },
+    ]),
+    similar("image", "i4", [
+      { path: `${SAM}\\Pictures\\Holiday 2024\\beach_sunset.jpg`, size: m(4.4), daysAgo: 360, w: 4032, h: 3024, sim: 100 },
+      { path: `${SAM}\\Pictures\\Holiday 2024\\beach_sunset_2.jpg`, size: m(4.3), daysAgo: 360, w: 4032, h: 3024, sim: 94 },
+    ]),
+    similar("image", "i5", [
+      { path: `${SAM}\\Pictures\\Wallpaper_8K_Aurora.png`, size: m(48), daysAgo: 400, w: 7680, h: 4320, sim: 100 },
+      { path: `${SAM}\\Downloads\\Wallpaper_Aurora_4K.jpg`, size: m(3.6), daysAgo: 399, w: 3840, h: 2160, sim: 93 },
+      { path: `${SAM}\\Desktop\\Wallpaper_Aurora_HD.jpg`, size: m(0.9), daysAgo: 398, w: 1920, h: 1080, sim: 89 },
+    ]),
+    similar("image", "i6", [
+      { path: `${SAM}\\Documents\\Work\\team-photo.jpg`, size: m(2.8), daysAgo: 180, w: 3000, h: 2000, sim: 100 },
+      { path: `${SAM}\\Downloads\\team-photo-WhatsApp.jpg`, size: 286000, daysAgo: 178, w: 1600, h: 1067, sim: 91 },
+    ]),
+  ];
+  const videos = !o.similarVideos ? [] : [
+    similar("video", "v1", [
+      { path: `${SAM}\\Videos\\Captures\\Screen Recording 2026-10-14.mp4`, size: g(1.9), daysAgo: 41, w: 2560, h: 1440, dur: 1284000, sim: 100 },
+      { path: `${SAM}\\Downloads\\Screen Recording 2026-10-14 compressed.mp4`, size: m(310), daysAgo: 40, w: 1920, h: 1080, dur: 1284000, sim: 94 },
+    ]),
+    similar("video", "v2", [
+      { path: `${SAM}\\Videos\\Family Trip Goa 2026 master.mp4`, size: g(3.4), daysAgo: 120, w: 3840, h: 2160, dur: 612000, sim: 100 },
+      { path: `${SAM}\\Desktop\\Goa trip WhatsApp.mp4`, size: m(48), daysAgo: 118, w: 1280, h: 720, dur: 611000, sim: 90 },
+      { path: `${SAM}\\Downloads\\Family Trip Goa 2026 (720p).mp4`, size: m(540), daysAgo: 119, w: 1280, h: 720, dur: 612000, sim: 96 },
+    ]),
+  ];
+
+  const reclaimable = groups.reduce((a, x) => a + x.reclaimable, 0) + folders.reduce((a, x) => a + x.reclaimable, 0);
+  return {
+    scanId: scan.scanId, roots: scan.roots, files: 48213, bytes: g(212.4),
+    skipped: { denied: 4, cloud: 126, small: minSize > 0 ? 9874 : 0 },
+    reclaimable, groups, folders, images, videos,
+  };
+}
+
+let dupesSeq = 0;
+let dupesRun = null; // { scanId, timer }
+let dupesLatest = null; // { scanId, roots, options, result }
+
+const PHASE_WEIGHT = { listing: 1.2, hashing: 2.2, images: 0.8, videos: 0.5, folders: 0.3 };
+const PHASE_TOTAL = { listing: 0, hashing: 6420, images: 1380, videos: 64, folders: 912 };
+const DUPE_SAMPLE = ["Pictures\\Camera Roll\\IMG_%.jpg", "Downloads\\setup-%.exe", "Documents\\Work\\report_%.pdf", "Videos\\Captures\\clip_%.mp4", "Music\\Albums\\track_%.mp3", "Desktop\\notes_%.txt"];
+
+function dupesStart({ roots, options } = {}) {
+  if (!roots?.length) throw "Choose at least one folder to scan.";
+  if (dupesRun) dupesCancel();
+  const o = { minSize: 0, similarImages: false, similarVideos: false, folders: false, ...(options ?? {}) };
+  const scanId = ++dupesSeq;
+  const phases = ["listing", "hashing"];
+  if (o.similarImages) phases.push("images");
+  if (o.similarVideos) phases.push("videos");
+  if (o.folders) phases.push("folders");
+  const weights = phases.map((p) => PHASE_WEIGHT[p]);
+  const sum = weights.reduce((a, b) => a + b, 0);
+  const TOTAL_MS = 5000;
+  const started = Date.now();
+  const run = { scanId, timer: null };
+  dupesRun = run;
+  run.timer = setInterval(() => {
+    const t = Math.min(1, (Date.now() - started) / TOTAL_MS);
+    let acc = 0, idx = phases.length - 1, within = 1;
+    for (let i = 0; i < phases.length; i++) {
+      const w = weights[i] / sum;
+      if (t <= acc + w || i === phases.length - 1) { idx = i; within = Math.min(1, (t - acc) / w); break; }
+      acc += w;
+    }
+    const phase = phases[idx];
+    const total = PHASE_TOTAL[phase];
+    const files = Math.floor(48213 * (idx === 0 ? within : 1));
+    const bytes = Math.floor(g(212.4) * (idx === 0 ? within : 1));
+    const done = phase === "listing" ? files : Math.floor(total * within);
+    mockEmit("dupes-progress", {
+      scanId, phase, files, bytes, done, total,
+      current: `${SAM}\\${pick(DUPE_SAMPLE).replace("%", String(rint(1000, 9999)))}`,
+    });
+    if (t >= 1) {
+      clearInterval(run.timer);
+      dupesRun = null;
+      dupesLatest = { scanId, roots: [...roots], options: o, result: null };
+      mockEmit("dupes-done", { scanId, ok: true, cancelled: false, error: null, elapsedMs: Date.now() - started });
+    }
+  }, 150);
+  return scanId;
+}
+
+function dupesCancel() {
+  if (!dupesRun) return;
+  const { timer, scanId } = dupesRun;
+  clearInterval(timer);
+  dupesRun = null;
+  mockEmit("dupes-done", { scanId, ok: false, cancelled: true, error: null, elapsedMs: 0 });
+}
+
+function dupesResult({ scanId } = {}) {
+  if (!dupesLatest || dupesLatest.scanId !== scanId) throw "These results are out of date. Scan again.";
+  if (!dupesLatest.result) dupesLatest.result = buildDupes(dupesLatest);
+  return structuredClone(dupesLatest.result);
+}
+
+function dupesThumb({ path } = {}) {
+  let seed = hashStr(String(path));
+  const r = dupesLatest?.result;
+  if (r) {
+    const grp = [...r.groups, ...r.images, ...r.videos].find((x) => x.files.some((f) => f.path === path));
+    if (grp) seed = hashStr(grp.id); // same picture for every copy / similar file of a group
+  }
+  const rnd = mulberry32(seed);
+  const hue = Math.floor(rnd() * 360), hue2 = (hue + 40 + Math.floor(rnd() * 80)) % 360;
+  const shape = Math.floor(rnd() * 3);
+  const cx = 20 + Math.floor(rnd() * 56), cy = 20 + Math.floor(rnd() * 56), rr = 12 + Math.floor(rnd() * 22);
+  const fill = `hsl(${hue2} 80% 75%)`;
+  const sh = shape === 0 ? `<circle cx="${cx}" cy="${cy}" r="${rr}" fill="${fill}"/>`
+    : shape === 1 ? `<rect x="${cx - rr}" y="${cy - rr}" width="${rr * 2}" height="${Math.round(rr * 1.4)}" rx="6" fill="${fill}"/>`
+    : `<polygon points="${cx},${cy - rr} ${cx + rr},${cy + rr} ${cx - rr},${cy + rr}" fill="${fill}"/>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl(${hue} 65% 52%)"/><stop offset="1" stop-color="hsl(${hue2} 70% 38%)"/></linearGradient></defs><rect width="96" height="96" fill="url(#g)"/>${sh}</svg>`;
+  return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
+}
+
+function dupesDelete({ scanId, paths } = {}) {
+  if (!dupesLatest || dupesLatest.scanId !== scanId || !dupesLatest.result) throw "These results are out of date. Scan again.";
+  const r = dupesLatest.result;
+  // Like the backend: a copy is removed when it is named, or sits inside a named folder copy.
+  const named = [...new Set((paths ?? []).map((p) => p.toLowerCase()))];
+  const under = (l) => named.some((d) => l.startsWith(d.replace(/\\+$/, "") + "\\"));
+  const del = { has: (p) => named.includes(p.toLowerCase()) || under(p.toLowerCase()) };
+  const counted = (p) => named.includes(p.toLowerCase()) && !under(p.toLowerCase()); // not gone with its folder
+  // a uniform view: every kind of group exposes its copies as `list` plus the size of one copy
+  const views = [
+    ...r.groups.map((x) => ({ list: () => x.files, set: (l) => (x.files = l), size: () => x.size })),
+    ...r.folders.map((x) => ({ list: () => x.folders, set: (l) => (x.folders = l), size: () => x.size })),
+    ...[...r.images, ...r.videos].map((x) => ({ list: () => x.files, set: (l) => (x.files = l), size: null })),
+  ];
+  for (const v of views) {
+    const l = v.list();
+    if (l.length && l.every((f) => del.has(f.path))) {
+      throw "Platter keeps at least one copy of every file, so it left these alone. Keep one copy in each group and try again.";
+    }
+  }
+  let removed = 0, freed = 0;
+  for (const v of views) {
+    const gone = v.list().filter((f) => del.has(f.path));
+    if (!gone.length) continue;
+    for (const f of gone) if (counted(f.path)) { removed++; freed += v.size ? v.size() : f.size; }
+    const rest = v.list().filter((f) => !del.has(f.path));
+    if (rest.length && !rest.some((f) => f.keep)) { rest[0].keep = true; rest[0].select = false; }
+    v.set(rest);
+  }
+  r.groups = r.groups.filter((x) => x.files.length >= 2);
+  r.folders = r.folders.filter((x) => x.folders.length >= 2);
+  r.images = r.images.filter((x) => x.files.length >= 2);
+  r.videos = r.videos.filter((x) => x.files.length >= 2);
+  for (const x of r.groups) x.reclaimable = x.size * x.files.filter((f) => f.select).length;
+  for (const x of r.folders) x.reclaimable = x.size * x.folders.filter((f) => f.select).length;
+  r.reclaimable = r.groups.reduce((a, x) => a + x.reclaimable, 0) + r.folders.reduce((a, x) => a + x.reclaimable, 0);
+  return { removed, freed, failed: [] };
+}
+
 /* ───────────────────────────── command table ───────────────────────────── */
 
 const handlers = {
   system_info: () => ({
-    elevated: mockState.elevated, computerName: "SKS-LAPTOP", systemDrive: "C",
+    elevated: mockState.elevated, askAdminAtStart: mockState.askAdmin, computerName: "SKS-LAPTOP", systemDrive: "C",
     userProfile: "C:\\Users\\SKS", downloads: downloadsPath,
   }),
   relaunch_elevated: () => { mockState.elevated = true; return true; },
+  set_ask_admin: ({ enabled } = {}) => { mockState.askAdmin = !!enabled; },
 
   list_volumes: () => vols.filter(present).map(pubVol),
   allocation_map: ({ letter, cells } = {}) => allocationMap(letter, cells),
@@ -792,6 +1316,21 @@ const handlers = {
   set_theme_pref: ({ theme } = {}) => { mockState.themePref = theme; },
   perf_mark: () => undefined,
   perf_enabled: () => false,
+
+  apps_list: () => appsList(),
+  app_icon: (a) => appIcon(a),
+  app_uninstall: (a) => appUninstall(a),
+  app_uninstall_stop_waiting: () => appUninstallStopWaiting(),
+  app_leftovers: (a) => appLeftovers(a),
+  orphan_leftovers: () => orphanLeftovers(),
+  leftovers_remove: (a) => leftoversRemove(a),
+
+  dupes_default_roots: () => DUPE_ROOTS.map((r) => ({ ...r })),
+  dupes_start: (a) => dupesStart(a),
+  dupes_cancel: () => dupesCancel(),
+  dupes_result: (a) => dupesResult(a),
+  dupes_thumb: (a) => dupesThumb(a),
+  dupes_delete: (a) => dupesDelete(a),
 };
 
 function cacheGetMany(keys = []) {
@@ -810,6 +1349,9 @@ function cacheGetMany(keys = []) {
 const DELAYS = {
   list_disks: 900, allocation_map: 300, rescan_disks: 600, check_volume: 1400, relaunch_elevated: 700,
   cleanup_analyze: 0, cleanup_run: 0,
+  apps_list: 700, app_icon: 25, app_uninstall: 0, app_uninstall_stop_waiting: 20, app_leftovers: 1200, orphan_leftovers: 1600,
+  leftovers_remove: 1500, dupes_default_roots: 60, dupes_start: 80, dupes_cancel: 20, dupes_result: 350,
+  dupes_thumb: 120, dupes_delete: 1200,
   cache_get_many: 4, app_ready: 0, set_theme_pref: 2, perf_mark: 0, perf_enabled: 0,
 };
 

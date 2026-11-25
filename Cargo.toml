@@ -1,6 +1,6 @@
 [package]
 name = "platter"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 description = "Platter — see, clean, optimize and manage the disks on a Windows PC"
 build = "build.rs"
@@ -18,6 +18,8 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rayon = "1"
+# 128-bit xxh3 content hashes for Duplicates (pure Rust, builds on the GNU toolchain).
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dependencies.windows-sys]
 version = "0.59"
@@ -35,6 +37,14 @@ features = [
   "Win32_System_EventLog",
   "Win32_System_Registry",
   "Win32_System_SystemInformation",
+  "Win32_System_Services",
+  "Win32_System_Ole",
+  "Win32_System_Variant",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_UI_Shell_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_System_ProcessStatus",
   "Wdk_Foundation",
   "Wdk_Storage_FileSystem",
 ]
