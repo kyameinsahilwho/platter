@@ -7,6 +7,10 @@
 **Platter is a free Windows disk utility, written in Rust with Tauri v2, that shows what is using space on your drives, cleans caches and app leftovers, finds duplicate files, trims SSDs and defragments hard disks, and checks disk health in one app.**
 
 <p align="center">
+  <a href="https://github.com/kyameinsahilwho/platter/releases/tag/v1.2.0"><img alt="Download for Windows" src="https://img.shields.io/badge/Download%20for%20Windows-1.2.0-0078D6?style=for-the-badge&logo=windows&logoColor=white"></a>
+</p>
+
+<p align="center">
   <img alt="Version 1.2.0" src="https://img.shields.io/badge/version-1.2.0-2f6f4f">
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows%20x64-0078D6?logo=windows&logoColor=white">
   <img alt="Built with Rust" src="https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white">
@@ -89,7 +93,16 @@ Measured with `bench/launch.ps1` (5 launches each, same PC, 15 s window, CPU sum
 
 Run it with `powershell -File bench\launch.ps1 -Runs 5` (add `-NoCache` to time a first launch). Set `PLATTER_PERF=<file>` to log a startup timeline.
 
-## Quick start
+## Download
+
+Get **Platter 1.2.0** from [GitHub Releases](https://github.com/kyameinsahilwho/platter/releases/tag/v1.2.0): download `Platter_1.2.0_x64-setup.exe` and run it.
+
+- **Windows 10 or later, x64.** The installer fetches the WebView2 runtime if Windows doesn't already have it.
+- **Per-user install.** Installing needs no administrator rights.
+- **SmartScreen warning.** The installer is not code-signed, so Windows may show "Windows protected your PC". Click **More info**, then **Run anyway**.
+- **Admin prompt at launch.** By default, Platter asks for administrator rights when it opens. Say no and it runs in standard mode; you can turn the prompt off (see [Administrator rights](#administrator-rights)).
+
+## Quick start (build from source)
 
 ### Requirements
 
@@ -153,7 +166,7 @@ The NSIS installer (per-user, no admin needed to install) lands in `<target-dir>
 ## FAQ
 
 ### Is Platter free?
-Yes. Platter has no paid tiers, accounts or ads, and the full source is in this repository so you can build it yourself with `cargo build --release`.
+Yes. Platter has no paid tiers, accounts or ads. Download the installer from [GitHub Releases](https://github.com/kyameinsahilwho/platter/releases/latest), or build it yourself from the full source in this repository with `cargo build --release`.
 
 ### Does Platter upload my files or need the internet?
 No. The app contains no network code and sends no telemetry; scans, caches and backups stay on your PC under `%LOCALAPPDATA%\app.platter.disks`. The only download is the WebView2 runtime, fetched by the installer if Windows doesn't already have it.
